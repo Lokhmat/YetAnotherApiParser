@@ -655,6 +655,7 @@
               "description": "Идентификатор записи показателя",
               "type": "integer",
               "format": "int32",
+              "x-pk": true,
               "nullable": true
             },
             "name": {
@@ -741,6 +742,7 @@
             "id": {
               "description": "Идентификатор записи",
               "x-fk": "publicationId",
+              "x-pk": true,
               "type": "integer",
               "format": "int32",
               "nullable": true

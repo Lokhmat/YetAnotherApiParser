@@ -30,8 +30,12 @@ func main() {
 
 	fmt.Printf("Base URL: %s\n", cfg.API.BaseURL)
 
-	// Generate migrations
-	mig := migration.New()
+	// Generate migrations with rate limiting
+	maxRPM := cfg.API.MaxRPM
+	if maxRPM <= 0 {
+		maxRPM = 60 // default to 60 requests per minute
+	}
+	mig := migration.New(maxRPM)
 	migrations, err := mig.GenerateMigrations(context.Background(), spec, cfg.API.BaseURL)
 	if err != nil {
 		log.Fatalf("generate migrations: %v", err)

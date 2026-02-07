@@ -14,11 +14,13 @@ import (
 
 type MigrationGenerator struct {
 	fetcher *fetcher.Fetcher
+	maxRPM  int
 }
 
-func New() *MigrationGenerator {
+func New(maxRPM int) *MigrationGenerator {
 	return &MigrationGenerator{
-		fetcher: fetcher.New(),
+		fetcher: fetcher.New(maxRPM),
+		maxRPM:  maxRPM,
 	}
 }
 

@@ -20,6 +20,7 @@ database:
 
 api:
   base_url: "http://example.com/api"
+  max_rpm: 60  # Maximum requests per minute (optional, default: 60)
 
 openapi_path: "path/to/spec.json"
 ```
@@ -43,6 +44,7 @@ The project uses the following OpenAPI extensions:
 
 - `x-res-type`: Mark handlers that should be fetched (applied to operations)
 - `x-fk`: Mark parameters that reference foreign keys from other handlers (applied to parameters)
+- `x-pk`: Mark fields that should be treated as PRIMARY KEY (applied to response properties)
 
 ### How it works
 
@@ -50,6 +52,48 @@ The project uses the following OpenAPI extensions:
 2. When an operation has `x-fk` parameters, the parser looks for matching values in previously fetched data
 3. The parser generates all combinations of FK values and fetches data for each combination
 4. Only fields defined in the OpenAPI schema are included in INSERT statements (unexpected API fields are ignored)
+
+### PRIMARY KEY Support
+
+Use the `x-pk` extension on response properties to mark them as PRIMARY KEY in CREATE TABLE statements:
+
+```yaml
+paths:
+  /users:
+    get:
+      x-res-type: user
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                    x-pk: true
+                  name:
+                    type: string
+```
+
+This generates:
+
+```sql
+CREATE TABLE response (
+  id INTEGER PRIMARY KEY,
+  name TEXT
+);
+```
+
+### Rate Limiting
+
+The project implements token bucket rate limiting to control the number of requests to external APIs. Configure the maximum requests per minute using `max_rpm` in your configuration:
+
+```yaml
+api:
+  base_url: "http://example.com/api"
+  max_rpm: 30  # Maximum 30 requests per minute (default: 60)
+```
 
 ## Example
 

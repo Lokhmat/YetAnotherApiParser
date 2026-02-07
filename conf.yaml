@@ -2,6 +2,7 @@ openapi_path: example/api.json
 
 api:
   base_url: http://www.cbr.ru/dataservice
+  max_rpm: 60
 
 database:
   connection_string: host=localhost user=postgres password=postgres dbname=postgres port=5440 sslmode=disable

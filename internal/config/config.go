@@ -8,6 +8,7 @@ import (
 
 type APIConfig struct {
 	BaseURL string `yaml:"base_url"`
+	MaxRPM  int    `yaml:"max_rpm"` // Maximum requests per minute
 }
 
 type DatabaseConfig struct {

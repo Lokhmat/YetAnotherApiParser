@@ -1,0 +1,1248 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "description": "Statistics universal API",
+    "version": "1.0",
+    "title": "Swagger SnowJS API"
+  },
+  "servers": [
+    {
+      "url": "http://www.cbr.ru/dataservice/",
+      "description": "Bank of Russia"
+    }
+  ],
+  "paths": {
+    "/data": {
+      "get": {
+        "parameters": [
+          {
+            "name": "y1",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "год начала периода",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "y2",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "год окончания периода",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "datasetId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "id показателя",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "publicationId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "id публикации",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "measureId",
+            "in": "query",
+            "explode": true,
+            "description": "id разреза",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "description": "Данные для таблицы",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/data"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/datasets": {
+      "get": {
+        "x-res-type": "one-shot",
+        "parameters": [
+          {
+            "name": "publicationId",
+            "x-fk": "publicationId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "Идентификатор публикации",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "description": "Показатели",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/datasets"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/measures": {
+      "get": {
+        "parameters": [
+          {
+            "name": "datasetId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "Идентификатор показателя",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "description": "Измерения (Разрезы)",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/measures"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/publications": {
+      "get": {
+        "parameters": [],
+        "description": "Категории",
+        "x-res-type": "one-shot",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/publications"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/years": {
+      "get": {
+        "parameters": [
+          {
+            "name": "datasetId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "Идентификатор показателя",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "measureId",
+            "in": "query",
+            "explode": true,
+            "description": "Идентификатор разреза",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "description": "Доступный диапазон годов",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/years"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/yearsEx": {
+      "get": {
+        "parameters": [
+          {
+            "name": "publicationId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "id публикации",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "ids",
+            "in": "query",
+            "explode": true,
+            "description": "Показатели/Измерения",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          }
+        ],
+        "description": "Диапазон годов (расширенная версия)",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/yearsEx"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/datasetsEx": {
+      "get": {
+        "parameters": [
+          {
+            "name": "publicationId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "ID Публикации",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "description": "Показатели и измерения (расширенная версия)",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/datasetsEx"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dataEx": {
+      "get": {
+        "parameters": [
+          {
+            "name": "publicationId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "ID Публикации",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "y1",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "год начала периода",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "y2",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "год окончания периода",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "i_ids",
+            "in": "query",
+            "explode": true,
+            "description": "идентификатор показателя (необязательный). Тип массив. При отсутствии аргумента должны выводится данные по всем показателям.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          },
+          {
+            "name": "m1_ids",
+            "in": "query",
+            "explode": true,
+            "description": "идентификатор 1-го разреза (таблица measures). Необязательный. При отсутствии аргумента должны выводится данные по всем позициям таблицы measures (при наличии ссылок в таблице obs).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          },
+          {
+            "name": "m2_ids",
+            "in": "query",
+            "explode": true,
+            "description": "идентификатор 2-го разреза (таблица elements). Необязательный. При отсутствии аргумента должны выводится данные по всем позициям таблицы elements (при наличии ссылок в таблице obs).",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          }
+        ],
+        "description": "Данные (расширенная версия)",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/dataEx"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/DatasetDescription": {
+      "get": {
+        "parameters": [
+          {
+            "name": "datasetId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "id показателя",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "description": "получение описания (методологии) показателя",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DatasetDescription"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/dataNew": {
+      "get": {
+        "parameters": [
+          {
+            "name": "categoryId",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "Идентификатор категории (обязательный)",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "y1",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "Год начала периода",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "y2",
+            "in": "query",
+            "required": true,
+            "explode": true,
+            "description": "Год окончания периода",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "i_ids",
+            "in": "query",
+            "explode": true,
+            "description": "Идентификатор показателя идентификатор (необязательный). При отсутствии аргумента выводятся данные по всем показателям",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          },
+          {
+            "name": "m1_ids",
+            "in": "query",
+            "explode": true,
+            "description": "Идентификатор 1-го разреза (необязательный). При отсутствии аргумента выводятся данные по всем позициям разреза.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          },
+          {
+            "name": "m2_ids",
+            "in": "query",
+            "explode": true,
+            "description": "Идентификатор 2-го разреза (необязательный). При отсутствии аргумента выводятся данные по всем позициям разреза.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          }
+        ],
+        "description": "Данные показателей",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/dataNew"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/categoryNew": {
+      "get": {
+        "parameters": [],
+        "description": "Список категорий и показателей",
+        "responses": {
+          "200": {
+            "description": "dataset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/categoryNew"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "data": {
+        "type": "object",
+        "properties": {
+          "RawData": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "element_id": {
+                  "description": "id показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "measure_id": {
+                  "description": "id разреза",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "unit_id": {
+                  "description": "id измерения",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "obs_val": {
+                  "description": "Значение",
+                  "type": "number",
+                  "format": "",
+                  "nullable": true
+                },
+                "rowId": {
+                  "description": "Дата id",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "dt": {
+                  "description": "текстовое значение даты (или периода)",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "periodicity": {
+                  "description": "Периодичность",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "colId": {
+                  "description": "идентификатор колонки",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "date": {
+                  "description": "Дата",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "digits": {
+                  "description": "Количество знаков после запятой",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "headerData": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Идентификатор показатея",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "elname": {
+                  "description": "Название показателя",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "units": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "id размерности",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "val": {
+                  "description": "Название",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "DTRange": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "FromY": {
+                  "description": "Год начала публикации",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "ToY": {
+                  "description": "Год окончания публикации",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "SType": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "sType": {
+                  "description": "Тип отображения данных",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "dsName": {
+                  "description": "Название показателя",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "PublName": {
+                  "description": "Название публикации",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "datasets": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Идентификатор записи показателя",
+              "type": "integer",
+              "format": "int32",
+              "nullable": true
+            },
+            "name": {
+              "description": "Название",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            },
+            "type": {
+              "description": "Тип отображения",
+              "type": "integer",
+              "format": "int32",
+              "nullable": true
+            },
+            "reporting": {
+              "description": "Тип показателя",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            },
+            "full_name": {
+              "description": "Полное название показателя",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            },
+            "link": {
+              "description": "Ссылка на источник данных",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            },
+            "updated_time": {
+              "description": "Дата обновления данных",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            }
+          }
+        }
+      },
+      "measures": {
+        "type": "object",
+        "properties": {
+          "measure": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Идентификатор разреза",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "name": {
+                  "description": "Название",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "parent_id": {
+                  "description": "Идентификатор родительского разреза",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "sort": {
+                  "description": "Порядок сортировки",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "publications": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Идентификатор записи",
+              "x-fk": "publicationId",
+              "type": "integer",
+              "format": "int32",
+              "nullable": true
+            },
+            "parent_id": {
+              "description": "Идентификатор корневой записи",
+              "type": "integer",
+              "format": "int32",
+              "nullable": true
+            },
+            "category_name": {
+              "description": "Название",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            },
+            "NoActive": {
+              "description": "Это раздел данных",
+              "type": "integer",
+              "format": "int32",
+              "nullable": true
+            },
+            "pub_description": {
+              "description": "Описание",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            },
+            "updated_time": {
+              "description": "Последнее обновление данных",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            }
+          }
+        }
+      },
+      "years": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "FromYear": {
+              "description": "Год начала периода",
+              "type": "integer",
+              "format": "int32",
+              "nullable": true
+            },
+            "ToYear": {
+              "description": "Год окончания периода",
+              "type": "integer",
+              "format": "int32",
+              "nullable": true
+            }
+          }
+        }
+      },
+      "yearsEx": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      "datasetsEx": {
+        "type": "object",
+        "properties": {
+          "indicators": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Идентификатор показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "parent_id": {
+                  "description": "Идентификатор показателя родителя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "name": {
+                  "description": "Название",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "measures_1": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Идентификатор измерения",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "parent_id": {
+                  "description": "Идентификатор измерения родителя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "name": {
+                  "description": "Название",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "measures_2": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Идентификатор измерения",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "parent_id": {
+                  "description": "Идентификатор измерения родителя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "name": {
+                  "description": "Название",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "units": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Идентификатор размерности",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "parent_id": {
+                  "description": "Идентификатор размерности родителя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "name": {
+                  "description": "Название",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "years": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "FromYear": {
+                  "description": "Год начала периода",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "ToYear": {
+                  "description": "Год окончания периода",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "dataEx": {
+        "type": "object",
+        "properties": {
+          "RawData": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "element_id": {
+                  "description": "id элемента",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "measure_id": {
+                  "description": "id разреза",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "unit_id": {
+                  "description": "id измерения",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "obs_val": {
+                  "description": "Значение",
+                  "type": "number",
+                  "format": "",
+                  "nullable": true
+                },
+                "rowId": {
+                  "description": "id записи",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "dt": {
+                  "description": "текстовое значение даты (или периода)",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "periodicity": {
+                  "description": "Периодичность",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "colId": {
+                  "description": "идентификатор колонки",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "date": {
+                  "description": "Дата",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "datasetId": {
+                  "description": "id показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "period_id": {
+                  "description": "id периода",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "links": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "colId": {
+                  "description": "ID колонки",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "name": {
+                  "description": "Название колонки",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "stype": {
+                  "description": "Тип",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "datasetId": {
+                  "description": "id показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "DatasetDescription": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "description": {
+              "description": "Описание (htm)",
+              "type": "string",
+              "format": "",
+              "nullable": true
+            }
+          }
+        }
+      },
+      "dataNew": {
+        "type": "object",
+        "properties": {
+          "RowData": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Уникальный идентификатор записи",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "indicator_id": {
+                  "description": "Идентификатор показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "measure1_id": {
+                  "description": "Идентификатор первого разреза",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "measure2_id": {
+                  "description": "Идентификатор второго разреза",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "unit_id": {
+                  "description": "Идентификатор единицы измерения",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "obs_val": {
+                  "description": "Значение показателя",
+                  "type": "number",
+                  "format": "",
+                  "nullable": true
+                },
+                "date": {
+                  "description": "Отчетная дата",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "periodicity": {
+                  "description": "Периодичность",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          },
+          "Links": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "indicator_id": {
+                  "description": "Идентификатор показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "indicator_parent": {
+                  "description": "Ссылка на родительский идентификатор показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "measure1_id": {
+                  "description": "Идентификатор первого разреза",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "measure2_id": {
+                  "description": "Идентификатор второго разреза",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "unit_id": {
+                  "description": "Идентификатор единицы измерения",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "indicator_name": {
+                  "description": "Наименование показателя",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "measure1_name": {
+                  "description": "Наименование первого разреза",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "measure2_name": {
+                  "description": "Наименование второго разреза",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "un_name": {
+                  "description": "Наименование единицы измерения",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      },
+      "categoryNew": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "category_id": {
+                  "description": "Идентификатор категории",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "category_name": {
+                  "description": "Наименование категории",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "indicator_id": {
+                  "description": "Идентификатор показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "indicator_name": {
+                  "description": "Наименование показателя",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "link": {
+                  "description": "Ссылка на описание методологии",
+                  "type": "string",
+                  "format": "",
+                  "nullable": true
+                },
+                "begin_dt": {
+                  "description": "Дата начала наблюдения",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "end_dt": {
+                  "description": "Дата окончания наблюдения",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                },
+                "indicator_parent": {
+                  "description": "Родительский идентификатор показателя",
+                  "type": "integer",
+                  "format": "int32",
+                  "nullable": true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

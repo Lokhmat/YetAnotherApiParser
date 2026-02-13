@@ -26,10 +26,10 @@ func New(maxRPM int) *MigrationGenerator {
 
 // OperationInfo holds information about an operation with its x-fk dependencies
 type OperationInfo struct {
-	Path       string
-	Op         *openapi3.Operation
-	NeedFKs    []string // list of x-fk names needed by this operation
-	IsFetched  bool     // whether this operation has been fetched (with all required FK values)
+	Path      string
+	Op        *openapi3.Operation
+	NeedFKs   []string // list of x-fk names needed by this operation
+	IsFetched bool     // whether this operation has been fetched (with all required FK values)
 }
 
 // GenerateMigrations generates migration DDL statements from OpenAPI specification
@@ -95,10 +95,7 @@ func (m *MigrationGenerator) GenerateMigrations(ctx context.Context, spec *opena
 
 				if combinations != nil && len(combinations) > 0 {
 					// Get schema name for this operation (for table creation)
-					resp := opInfo.Op.Responses.Value("200")
-					if resp == nil {
-						resp = opInfo.Op.Responses.Value("201")
-					}
+					resp := m.getSuccessResponse(opInfo.Op)
 					var schemaName string
 					if resp != nil && resp.Value != nil {
 						media := resp.Value.Content.Get("application/json")
@@ -115,8 +112,13 @@ func (m *MigrationGenerator) GenerateMigrations(ctx context.Context, spec *opena
 
 					// Generate CREATE TABLE only once per unique table
 					if schemaName != "" && !generatedTables[schemaName] {
+						media := resp.Value.Content.Get("application/json")
+						if media == nil || media.Schema == nil {
+							log.Printf("Failed to generate CREATE TABLE for %s: missing JSON schema", path)
+							continue
+						}
 						ddlStr, err := ddl.GenerateDDLFromSchema(
-							opInfo.Op.Responses.Value("200").Value.Content.Get("application/json").Schema,
+							media.Schema,
 							spec,
 							schemaName,
 						)
@@ -132,7 +134,7 @@ func (m *MigrationGenerator) GenerateMigrations(ctx context.Context, spec *opena
 					// Note: CREATE TABLE is already generated above, so we only need INSERT statements
 					for _, combo := range combinations {
 						params := m.buildParamsMap(opInfo.NeedFKs, combo)
-						insertSQL, err := m.FetchDataAndGenerateInserts(ctx, baseURL, path, opInfo.Op, params, spec)
+						insertSQL, err := m.FetchDataAndGenerateInserts(ctx, baseURL, path, opInfo.Op, params, spec, fetchedFKValues)
 						if err != nil {
 							log.Printf("Failed to generate INSERT for %s %s: %v", "GET", path, err)
 							continue
@@ -154,8 +156,6 @@ func (m *MigrationGenerator) GenerateMigrations(ctx context.Context, spec *opena
 			break
 		}
 
-		// 6. Extract new FK values from the latest fetches
-		m.extractFKValuesFromOperations(ctx, baseURL, operations, spec, fetchedFKValues)
 	}
 
 	return migrations, nil
@@ -250,65 +250,6 @@ func (m *MigrationGenerator) generateCombinations(valueLists [][]interface{}) []
 	return result
 }
 
-// extractFKValuesFromOperations extracts FK values from operations that have been fetched
-func (m *MigrationGenerator) extractFKValuesFromOperations(ctx context.Context, baseURL string, operations []struct {
-	path string
-	op   *openapi3.Operation
-}, spec *openapi3.T, fetchedFKValues map[string][]interface{}) {
-	// For each operation that was just fetched, extract new FK values
-	// Only extract from operations that have no FK dependencies (source operations)
-	for _, opInfo := range operations {
-		// Only extract FK values from operations without dependencies
-		// because those with dependencies are fetched in the loop with params
-		if len(opInfo.op.Parameters) == 0 {
-			m.extractFKValuesFromResponse(ctx, baseURL, opInfo.path, opInfo.op, spec, fetchedFKValues)
-		}
-	}
-}
-
-// extractFKValuesFromResponse fetches the data and extracts x-fk values from the response
-func (m *MigrationGenerator) extractFKValuesFromResponse(ctx context.Context, baseURL, path string, op *openapi3.Operation, spec *openapi3.T, fkValues map[string][]interface{}) {
-	// Get response schema first
-	resp := op.Responses.Value("200")
-	if resp == nil {
-		resp = op.Responses.Value("201")
-	}
-	if resp == nil || resp.Value == nil {
-		return
-	}
-
-	media := resp.Value.Content.Get("application/json")
-	if media == nil || media.Schema == nil {
-		return
-	}
-
-	// Try to fetch data
-	data, err := m.fetcher.FetchData(ctx, baseURL, path, op, nil)
-	if err != nil {
-		log.Printf("Warning: failed to fetch data for %s: %v", path, err)
-		return
-	}
-
-	// Parse the JSON and extract x-fk values from response
-	var records []map[string]interface{}
-	if err := json.Unmarshal(data, &records); err != nil {
-		log.Printf("Warning: failed to unmarshal data for %s: %v", path, err)
-		return
-	}
-
-	// Find fields with x-fk extension
-	fkFieldNames := m.findFKFields(op, media, spec)
-
-	// Extract FK values from each record
-	for _, record := range records {
-		for paramName, responseField := range fkFieldNames {
-			if val, exists := record[responseField]; exists {
-				fkValues[paramName] = append(fkValues[paramName], val)
-			}
-		}
-	}
-}
-
 // findFKFields finds fields with x-fk extension in the operation parameters and response schema
 func (m *MigrationGenerator) findFKFields(op *openapi3.Operation, media *openapi3.MediaType, spec *openapi3.T) map[string]string {
 	fkFieldNames := make(map[string]string) // map of parameter name -> response field name
@@ -318,35 +259,37 @@ func (m *MigrationGenerator) findFKFields(op *openapi3.Operation, media *openapi
 		if paramRef == nil || paramRef.Value == nil {
 			continue
 		}
-		if _, ok := paramRef.Value.Extensions["x-fk"]; ok {
+		if fkVal, ok := paramRef.Value.Extensions["x-fk"]; ok {
 			paramName := paramRef.Value.Name
 			responseField := paramName
+			if v, ok := fkVal.(string); ok && v != "" {
+				responseField = v
+			}
 			fkFieldNames[paramName] = responseField
 		}
 	}
 
-	// If no FK field names found from parameters, try to find them from the schema
-	if len(fkFieldNames) == 0 {
-		schema := media.Schema.Value
-		if schema == nil {
-			return fkFieldNames
-		}
+	schema := media.Schema.Value
+	if schema == nil {
+		return fkFieldNames
+	}
 
-		// Handle array type - get the items schema
-		if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil {
-			schema = schema.Items.Value
-		}
+	// Handle array type - get the items schema
+	if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil {
+		schema = schema.Items.Value
+	}
 
-		// Check schema properties for x-fk extensions
-		if schema != nil && schema.Properties != nil {
-			for propName, propRef := range schema.Properties {
-				if propRef == nil || propRef.Value == nil {
-					continue
-				}
-				if fkVal, ok := propRef.Value.Extensions["x-fk"]; ok {
-					responseField := propName
-					paramName := fmt.Sprintf("%v", fkVal)
-					fkFieldNames[paramName] = responseField
+	// Check schema properties for x-fk extensions.
+	// x-fk value is the dependency key; property name is where to read it from response JSON.
+	if schema != nil && schema.Properties != nil {
+		for propName, propRef := range schema.Properties {
+			if propRef == nil || propRef.Value == nil {
+				continue
+			}
+			if fkVal, ok := propRef.Value.Extensions["x-fk"]; ok {
+				dependencyKey := fmt.Sprintf("%v", fkVal)
+				if dependencyKey != "" {
+					fkFieldNames[dependencyKey] = propName
 				}
 			}
 		}
@@ -389,10 +332,7 @@ func (m *MigrationGenerator) getExpectedColumns(resp *openapi3.ResponseRef, spec
 }
 
 func (m *MigrationGenerator) generateMigrationForOperation(ctx context.Context, baseURL, path string, op *openapi3.Operation, spec *openapi3.T) (string, error) {
-	resp := op.Responses.Value("200")
-	if resp == nil {
-		resp = op.Responses.Value("201")
-	}
+	resp := m.getSuccessResponse(op)
 	if resp == nil || resp.Value == nil {
 		return "", fmt.Errorf("no successful response found")
 	}
@@ -421,12 +361,12 @@ func (m *MigrationGenerator) generateMigrationForOperation(ctx context.Context, 
 // generateInsertStatements generates INSERT statements from JSON data
 // Only includes columns that are expected (defined in schema) to avoid unexpected fields from API
 func (m *MigrationGenerator) generateInsertStatements(data []byte, tableName string, expectedColumns []string) (string, error) {
-	var records []map[string]interface{}
-	if err := json.Unmarshal(data, &records); err != nil {
+	records, err := parseJSONRecords(data)
+	if err != nil {
 		return "", fmt.Errorf("unmarshal JSON: %w", err)
 	}
 
-	var insertStatements string
+	var b strings.Builder
 	for _, record := range records {
 		var columns []string
 		var values []string
@@ -435,13 +375,7 @@ func (m *MigrationGenerator) generateInsertStatements(data []byte, tableName str
 		for _, colName := range expectedColumns {
 			if value, exists := record[colName]; exists {
 				columns = append(columns, colName)
-				strVal, ok := value.(string)
-				if ok {
-					escaped := strings.ReplaceAll(strVal, "'", "''")
-					values = append(values, fmt.Sprintf("'%s'", escaped))
-				} else {
-					values = append(values, fmt.Sprintf("%v", value))
-				}
+				values = append(values, toSQLLiteral(value))
 			}
 		}
 
@@ -452,20 +386,18 @@ func (m *MigrationGenerator) generateInsertStatements(data []byte, tableName str
 				strings.Join(columns, ", "),
 				strings.Join(values, ", "),
 			)
-			insertStatements += insertStmt + "\n"
+			b.WriteString(insertStmt)
+			b.WriteString("\n")
 		}
 	}
 
-	return insertStatements, nil
+	return b.String(), nil
 }
 
 // FetchDataAndGenerateInserts fetches data and generates only INSERT statements (no CREATE TABLE)
 // Used when generating migrations in dependency order - CREATE TABLE is generated once per table
-func (m *MigrationGenerator) FetchDataAndGenerateInserts(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, spec *openapi3.T) (string, error) {
-	resp := op.Responses.Value("200")
-	if resp == nil {
-		resp = op.Responses.Value("201")
-	}
+func (m *MigrationGenerator) FetchDataAndGenerateInserts(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, spec *openapi3.T, fetchedFKValues map[string][]interface{}) (string, error) {
+	resp := m.getSuccessResponse(op)
 	if resp == nil || resp.Value == nil {
 		return "", fmt.Errorf("no successful response found")
 	}
@@ -493,6 +425,8 @@ func (m *MigrationGenerator) FetchDataAndGenerateInserts(ctx context.Context, ba
 		return "", nil
 	}
 
+	m.extractFKValuesFromData(data, op, media, spec, fetchedFKValues)
+
 	log.Printf("Successfully fetched data from %s", path)
 	log.Printf("Data length: %d bytes", len(data))
 
@@ -503,4 +437,85 @@ func (m *MigrationGenerator) FetchDataAndGenerateInserts(ctx context.Context, ba
 	}
 
 	return insertStatements, nil
+}
+
+func (m *MigrationGenerator) extractFKValuesFromData(data []byte, op *openapi3.Operation, media *openapi3.MediaType, spec *openapi3.T, fkValues map[string][]interface{}) {
+	if media == nil || media.Schema == nil {
+		return
+	}
+
+	records, err := parseJSONRecords(data)
+	if err != nil {
+		return
+	}
+
+	fkFieldNames := m.findFKFields(op, media, spec)
+	for _, record := range records {
+		for dependencyKey, responseField := range fkFieldNames {
+			if val, exists := record[responseField]; exists {
+				fkValues[dependencyKey] = appendUniqueValue(fkValues[dependencyKey], val)
+			}
+		}
+	}
+}
+
+func (m *MigrationGenerator) getSuccessResponse(op *openapi3.Operation) *openapi3.ResponseRef {
+	if op == nil || op.Responses == nil {
+		return nil
+	}
+
+	if resp := op.Responses.Value("200"); resp != nil {
+		return resp
+	}
+	if resp := op.Responses.Value("201"); resp != nil {
+		return resp
+	}
+
+	return nil
+}
+
+func parseJSONRecords(data []byte) ([]map[string]interface{}, error) {
+	var arrayRecords []map[string]interface{}
+	if err := json.Unmarshal(data, &arrayRecords); err == nil {
+		return arrayRecords, nil
+	}
+
+	var singleRecord map[string]interface{}
+	if err := json.Unmarshal(data, &singleRecord); err == nil {
+		return []map[string]interface{}{singleRecord}, nil
+	}
+
+	return nil, fmt.Errorf("expected JSON object or array of objects")
+}
+
+func toSQLLiteral(v interface{}) string {
+	switch value := v.(type) {
+	case nil:
+		return "NULL"
+	case string:
+		return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+	case bool:
+		if value {
+			return "TRUE"
+		}
+		return "FALSE"
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%v", value)
+	default:
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return "NULL"
+		}
+		return "'" + strings.ReplaceAll(string(encoded), "'", "''") + "'"
+	}
+}
+
+func appendUniqueValue(values []interface{}, candidate interface{}) []interface{} {
+	candidateKey := fmt.Sprintf("%v", candidate)
+	for _, existing := range values {
+		if fmt.Sprintf("%v", existing) == candidateKey {
+			return values
+		}
+	}
+	return append(values, candidate)
 }

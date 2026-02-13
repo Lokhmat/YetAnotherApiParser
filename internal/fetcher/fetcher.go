@@ -20,10 +20,10 @@ type RateLimiter struct {
 	mu           sync.Mutex
 	tokens       float64
 	lastRefill   time.Time
-	maxRPM       int         // max requests per minute
-	refillRate   float64     // tokens per second
-	lastRequest  time.Time   // track time of last request for proper rate limiting
-	requestCount int         // number of requests in current second
+	maxRPM       int       // max requests per minute
+	refillRate   float64   // tokens per second
+	lastRequest  time.Time // track time of last request for proper rate limiting
+	requestCount int       // number of requests in current second
 }
 
 // NewRateLimiter creates a new rate limiter based on max requests per minute
@@ -99,13 +99,35 @@ func (f *Fetcher) FetchData(ctx context.Context, baseURL string, path string, op
 		return nil, fmt.Errorf("parse base URL: %w", err)
 	}
 
+	// Resolve path parameters in /resource/{id} style paths.
+	resolvedPath := path
+	for _, paramRef := range op.Parameters {
+		if paramRef == nil || paramRef.Value == nil {
+			continue
+		}
+		p := paramRef.Value
+		if p.In != "path" {
+			continue
+		}
+
+		val, ok := params[p.Name]
+		if !ok {
+			if p.Required {
+				return nil, fmt.Errorf("missing required path parameter: %s", p.Name)
+			}
+			continue
+		}
+
+		resolvedPath = strings.ReplaceAll(resolvedPath, "{"+p.Name+"}", url.PathEscape(val))
+	}
+
 	// Add path - ensure proper slash handling
 	if u.Path == "" {
 		// If baseURL has no path, just use the path
-		u.Path = strings.TrimLeft(path, "/")
+		u.Path = strings.TrimLeft(resolvedPath, "/")
 	} else {
 		// Otherwise, concatenate with proper slashes
-		u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(path, "/")
+		u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(resolvedPath, "/")
 	}
 
 	// Build query parameters

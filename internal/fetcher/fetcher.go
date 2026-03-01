@@ -2,12 +2,13 @@ package fetcher
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,45 @@ type RateLimiter struct {
 	refillRate   float64   // tokens per second
 	lastRequest  time.Time // track time of last request for proper rate limiting
 	requestCount int       // number of requests in current second
+}
+
+var runLogMu sync.Mutex
+
+func writeRunLog(method, requestURL string, params map[string]string, statusCode int, reqErr error) {
+	runLogMu.Lock()
+	defer runLogMu.Unlock()
+
+	f, err := os.OpenFile("runlog.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	paramKeys := make([]string, 0, len(params))
+	for k := range params {
+		paramKeys = append(paramKeys, k)
+	}
+	sort.Strings(paramKeys)
+
+	paramPairs := make([]string, 0, len(paramKeys))
+	for _, k := range paramKeys {
+		paramPairs = append(paramPairs, fmt.Sprintf("%s=%s", k, params[k]))
+	}
+
+	line := fmt.Sprintf(
+		"%s method=%s url=%s params={%s} status=%d",
+		time.Now().Format(time.RFC3339),
+		method,
+		requestURL,
+		strings.Join(paramPairs, ","),
+		statusCode,
+	)
+	if reqErr != nil {
+		line += fmt.Sprintf(" error=%q", reqErr.Error())
+	}
+	line += "\n"
+
+	_, _ = f.WriteString(line)
 }
 
 // NewRateLimiter creates a new rate limiter based on max requests per minute
@@ -75,20 +115,51 @@ func (rl *RateLimiter) Wait() {
 type Fetcher struct {
 	client    *http.Client
 	rateLimit *RateLimiter
+	cfg       ClientConfig
 }
 
-func New(maxRPM int) *Fetcher {
-	// Create HTTP client with custom transport for testing
-	// Note: In production, you should use proper SSL verification
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+type ClientConfig struct {
+	RequestTimeout    time.Duration
+	ErrorsMaxRetries  int
+	BasicRetryTimeout time.Duration
+}
+
+func DefaultClientConfig() ClientConfig {
+	return ClientConfig{
+		RequestTimeout:    30 * time.Second,
+		ErrorsMaxRetries:  0,
+		BasicRetryTimeout: 1 * time.Second,
 	}
+}
+
+func New(maxRPM int, cfgs ...ClientConfig) *Fetcher {
+	cfg := DefaultClientConfig()
+	if len(cfgs) > 0 {
+		cfg = cfgs[0]
+		if cfg.RequestTimeout <= 0 {
+			cfg.RequestTimeout = 30 * time.Second
+		}
+		if cfg.BasicRetryTimeout <= 0 {
+			cfg.BasicRetryTimeout = 1 * time.Second
+		}
+		if cfg.ErrorsMaxRetries < 0 {
+			cfg.ErrorsMaxRetries = 0
+		}
+	}
+
+	// Use secure defaults: standard certificate verification and system CAs.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ForceAttemptHTTP2 = true
+	// Keep direct behavior from previous custom transport: do not auto-use env proxies.
+	tr.Proxy = nil
 
 	return &Fetcher{
 		client: &http.Client{
 			Transport: tr,
+			Timeout:   cfg.RequestTimeout,
 		},
 		rateLimit: NewRateLimiter(maxRPM),
+		cfg:       cfg,
 	}
 }
 
@@ -173,31 +244,64 @@ func (f *Fetcher) FetchData(ctx context.Context, baseURL string, path string, op
 		}
 	}
 
-	// Wait for rate limiter to allow the request
-	if f.rateLimit != nil {
-		f.rateLimit.Wait()
+	attempts := f.cfg.ErrorsMaxRetries + 1
+	for attempt := 0; attempt < attempts; attempt++ {
+		// Wait for rate limiter before each attempt
+		if f.rateLimit != nil {
+			f.rateLimit.Wait()
+		}
+
+		// Send request
+		resp, err := f.client.Do(req)
+		if err != nil {
+			writeRunLog(http.MethodGet, u.String(), params, -1, err)
+			return nil, fmt.Errorf("send request: %w", err)
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		writeRunLog(http.MethodGet, u.String(), params, resp.StatusCode, nil)
+		if readErr != nil {
+			return nil, fmt.Errorf("read response body: %w", readErr)
+		}
+
+		// Success
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return body, nil
+		}
+
+		// Retry policy
+		shouldRetry := false
+		retryDelay := f.cfg.BasicRetryTimeout
+		if resp.StatusCode == http.StatusTooManyRequests {
+			shouldRetry = attempt < f.cfg.ErrorsMaxRetries
+			retryDelay = f.cfg.BasicRetryTimeout * time.Duration(1<<attempt)
+		} else if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+			shouldRetry = attempt < f.cfg.ErrorsMaxRetries
+		}
+
+		if !shouldRetry {
+			return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
+		}
+
+		if err := sleepWithContext(ctx, retryDelay); err != nil {
+			return nil, err
+		}
 	}
 
-	// Send request
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
+	return nil, fmt.Errorf("request failed after retries")
+}
 
-	// Check status code
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("unexpected status code %d: %s", resp.StatusCode, string(body))
-	}
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response body: %w", err)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-
-	return body, nil
 }
 
 func (f *Fetcher) FetchAndParse(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, target interface{}) error {

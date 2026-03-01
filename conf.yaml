@@ -1,8 +1,12 @@
-openapi_path: example/api.json
+openapi_path: example/binance.json
 
 api:
-  base_url: http://www.cbr.ru/dataservice
+  base_url: https://api.binance.com
   max_rpm: 60
+  request_timeout: 30
+  retries:
+    errors_max_retries: 3
+    basic_retry_timeout: 2
 
 database:
   connection_string: host=localhost user=postgres password=postgres dbname=postgres port=5440 sslmode=disable

@@ -7,8 +7,15 @@ import (
 )
 
 type APIConfig struct {
-	BaseURL string `yaml:"base_url"`
-	MaxRPM  int    `yaml:"max_rpm"` // Maximum requests per minute
+	BaseURL        string      `yaml:"base_url"`
+	MaxRPM         int         `yaml:"max_rpm"`         // Maximum requests per minute
+	RequestTimeout int         `yaml:"request_timeout"` // Request timeout in seconds
+	Retries        RetryConfig `yaml:"retries"`         // Retry configuration
+}
+
+type RetryConfig struct {
+	ErrorsMaxRetries  int `yaml:"errors_max_retries"`  // Retries for 5xx and 429
+	BasicRetryTimeout int `yaml:"basic_retry_timeout"` // Base retry timeout in seconds
 }
 
 type DatabaseConfig struct {

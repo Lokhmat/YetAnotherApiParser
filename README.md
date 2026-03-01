@@ -1,111 +1,177 @@
 # API Parser
 
-API Parser is a Go project that automatically fetches API data from OpenAPI specifications and generates PostgreSQL migrations (CREATE TABLE and INSERT statements).
+`api-parser` reads an OpenAPI spec, fetches selected API endpoints, and generates PostgreSQL SQL:
 
-## Features
+- `CREATE TABLE ...`
+- `INSERT INTO ...`
 
-- Reads OpenAPI (Swagger) specifications from YAML/JSON files
-- Automatically generates database schema (CREATE TABLE statements) from API response schemas
-- Fetches API data and generates INSERT statements for PostgreSQL
-- Supports dependent API calls through `x-fk` and `x-res-type` extensions
-- Handles foreign key dependencies between API endpoints
+It can:
+
+- resolve endpoint dependencies with `x-fk`
+- fetch in dependency order
+- flatten marked nested response objects into separate tables (`x-table-name`)
+- save/apply migrations
+- write request run logs to `runlog.log`
+
+## Requirements
+
+- Go 1.21+
+- PostgreSQL (optional; if DB is unavailable, SQL is still written to file)
 
 ## Configuration
 
-Create a `conf.yaml` file with the following structure:
+Create `conf.yaml`:
 
 ```yaml
 database:
   connection_string: "host=localhost port=5440 user=postgres password=postgres dbname=api_parser"
 
 api:
-  base_url: "http://example.com/api"
-  max_rpm: 60  # Maximum requests per minute (optional, default: 60)
+  base_url: "https://api.example.com"
+  max_rpm: 60
+  request_timeout: 30  # seconds
+  retries:
+    errors_max_retries: 3
+    basic_retry_timeout: 2  # seconds
 
-openapi_path: "path/to/spec.json"
+openapi_path: "example/api.json"
 ```
 
-## Usage
+## Run
 
 ```bash
 go run ./cmd/main.go -config conf.yaml
 ```
 
-Or build and run:
+Behavior:
 
-```bash
-go build -o api-parser ./cmd/main.go
-./api-parser -config conf.yaml
-```
+1. Load config + OpenAPI spec.
+2. Generate DDL/INSERT statements.
+3. Try applying statements to DB.
+4. If DB connection fails, write SQL to `res.sql`.
 
-## OpenAPI Extensions
+## Extension Reference
 
-The project uses the following OpenAPI extensions:
+### `x-res-type` (operation)
 
-- `x-res-type`: Mark handlers that should be fetched (applied to operations)
-- `x-fk`: Mark parameters that reference foreign keys from other handlers (applied to parameters)
-- `x-pk`: Mark fields that should be treated as PRIMARY KEY (applied to response properties)
+Marks a GET operation as fetchable by parser.
 
-### How it works
+Without `x-res-type`, operation is ignored.
 
-1. Operations without `x-fk` parameters are fetched first, and their response data is used to populate the database
-2. When an operation has `x-fk` parameters, the parser looks for matching values in previously fetched data
-3. The parser generates all combinations of FK values and fetches data for each combination
-4. Only fields defined in the OpenAPI schema are included in INSERT statements (unexpected API fields are ignored)
+### `x-fk` (operation parameter)
 
-### PRIMARY KEY Support
+Controls dependency-driven parameter value generation.
 
-Use the `x-pk` extension on response properties to mark them as PRIMARY KEY in CREATE TABLE statements:
+Supported forms:
 
 ```yaml
-paths:
-  /users:
-    get:
-      x-res-type: user
-      responses:
-        '200':
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  id:
-                    type: integer
-                    x-pk: true
-                  name:
-                    type: string
+# Simple mode
+x-fk: true
 ```
-
-This generates:
-
-```sql
-CREATE TABLE response (
-  id INTEGER PRIMARY KEY,
-  name TEXT
-);
-```
-
-### Rate Limiting
-
-The project implements token bucket rate limiting to control the number of requests to external APIs. Configure the maximum requests per minute using `max_rpm` in your configuration:
 
 ```yaml
-api:
-  base_url: "http://example.com/api"
-  max_rpm: 30  # Maximum 30 requests per minute (default: 60)
+# Extended mode
+x-fk:
+  id: publicationId     # optional, defaults to parameter name
+  values: [1, 2, 3]     # optional seed values (scalars or arrays)
+  filter:               # optional
+    op: in              # in | gt | gte | lt | lte
+    values: [2, 3]      # required for op=in
 ```
 
-## Example
+Rules:
 
-See `example/api.json` for an example OpenAPI specification that uses the `x-res-type` and `x-fk` extensions.
+1. `x-fk: "..."` string format is rejected for parameters.
+2. Candidate values per FK param are:
+   - fetched values by `id`
+   - union with optional `values`
+3. Filter is applied before cartesian product.
+4. `gt/gte/lt/lte` support:
+   - numeric values
+   - strict RFC3339 datetime strings
+5. If any FK param has an empty candidate set after filtering, operation is skipped (no requests).
 
-## Output
+### `x-pk` (response property)
 
-The project outputs:
-- `res.sql`: SQL file containing CREATE TABLE and INSERT statements
-- Database migrations (if database connection is successful)
+Marks a property as primary key.
 
-## Dependencies
+Used in both:
 
-- Go 1.21+
-- PostgreSQL (for database migrations)
+- classic top-level table mode
+- `x-table-name` marked mode
+
+### `x-table-name` (response object schema)
+
+Marks nested object/array item object that should be extracted as a separate table.
+
+If at least one `x-table-name` exists in an operation response schema, parser switches that operation to **marked-only mode**:
+
+1. Only marked objects are materialized as tables.
+2. Each marked object must have exactly one `x-pk`.
+3. Nested relations:
+   - object -> object: parent stores child PK
+   - object -> array: parent stores typed PK array
+   - array -> object: parent row stores child PK
+   - array -> array: join table `<parent>_<child>_link`
+4. Unmarked containers are ignored for table generation in marked mode.
+
+## Dependency Resolution Model
+
+For fetchable operations (`x-res-type`):
+
+1. Build operation FK specs from parameter `x-fk`.
+2. For each op, build FK candidate lists.
+3. Build cartesian product of FK lists.
+4. Request operation for each combination.
+5. Extract FK values from responses and feed downstream operations.
+
+Operations without any `x-fk` are called once with empty parameter combination.
+
+## Request Parameter Serialization Notes
+
+For generated FK parameter values:
+
+- values are converted via `fmt.Sprintf("%v", value)` before request build
+- query params are set with `url.Values.Set(...)`
+
+Important for arrays:
+
+- array value like `["BTCUSDT","BNBBTC"]` is currently serialized in Go default style (e.g. `[BTCUSDT BNBBTC]`), not JSON string automatically.
+- if API expects JSON array string in query, provide it as a single string seed value, for example:
+  - `values: ["[\"BTCUSDT\",\"BNBBTC\"]"]`
+
+## Run Log
+
+Each HTTP request appends one line to `runlog.log` in current working directory:
+
+- timestamp (RFC3339)
+- method
+- URL
+- params
+- status code
+- transport error (if request failed before response)
+
+Example line:
+
+```text
+2026-03-01T12:34:56Z method=GET url=https://api.binance.com/api/v3/exchangeInfo?symbols=%5BBTCUSDT+BNBBTC%5D params={symbols=[BTCUSDT BNBBTC]} status=200
+```
+
+## Retry Policy
+
+- `5xx` responses are retried up to `api.retries.errors_max_retries` times.
+- Delay for `5xx` retries is fixed: `api.retries.basic_retry_timeout`.
+- `429 Too Many Requests` retries use exponential backoff with base `api.retries.basic_retry_timeout`.
+  - retry delays: `Y`, `2Y`, `4Y`, ...
+- Other non-2xx responses are not retried.
+
+## Outputs
+
+- `res.sql` (when DB apply is skipped/failed, or when you inspect generated SQL)
+- DB migrations applied directly (if DB connection succeeds)
+- `runlog.log` (request trace)
+
+## Project Examples
+
+- `example/api.json`: minimal dependency chain sample
+- `example/binance.json`: real-world endpoint with `x-fk` seeds + `x-table-name`

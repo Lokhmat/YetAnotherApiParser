@@ -7,9 +7,11 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"api-parser/internal/config"
 	"api-parser/internal/database"
+	"api-parser/internal/fetcher"
 	"api-parser/internal/migration"
 	"api-parser/internal/openapi"
 )
@@ -35,7 +37,23 @@ func main() {
 	if maxRPM <= 0 {
 		maxRPM = 60 // default to 60 requests per minute
 	}
-	mig := migration.New(maxRPM)
+	requestTimeout := time.Duration(cfg.API.RequestTimeout) * time.Second
+	if requestTimeout <= 0 {
+		requestTimeout = 30 * time.Second
+	}
+	basicRetryTimeout := time.Duration(cfg.API.Retries.BasicRetryTimeout) * time.Second
+	if basicRetryTimeout <= 0 {
+		basicRetryTimeout = 1 * time.Second
+	}
+	errorsMaxRetries := cfg.API.Retries.ErrorsMaxRetries
+	if errorsMaxRetries < 0 {
+		errorsMaxRetries = 0
+	}
+	mig := migration.New(maxRPM, fetcher.ClientConfig{
+		RequestTimeout:    requestTimeout,
+		ErrorsMaxRetries:  errorsMaxRetries,
+		BasicRetryTimeout: basicRetryTimeout,
+	})
 	migrations, err := mig.GenerateMigrations(context.Background(), spec, cfg.API.BaseURL)
 	if err != nil {
 		log.Fatalf("generate migrations: %v", err)

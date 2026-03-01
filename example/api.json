@@ -86,7 +86,9 @@
         "parameters": [
           {
             "name": "publicationId",
-            "x-fk": "publicationId",
+            "x-fk": {
+              "id": "publicationId"
+            },
             "in": "query",
             "required": true,
             "explode": true,

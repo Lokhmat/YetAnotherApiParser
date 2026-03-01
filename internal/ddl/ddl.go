@@ -2,22 +2,28 @@ package ddl
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
 type Table struct {
-	Name    string
-	Columns []Column
+	Name       string
+	Columns    []Column
 	PrimaryKey string
 }
 
 type Column struct {
-	Name     string
-	Type     string
-	Nullable bool
+	Name       string
+	Type       string
+	Nullable   bool
 	PrimaryKey bool
+}
+
+type RelationColumnSpec struct {
+	Name string
+	Type string
 }
 
 func GenerateDDLFromSchema(schemaRef *openapi3.SchemaRef, spec *openapi3.T, schemaName string) (string, error) {
@@ -65,6 +71,90 @@ func GenerateDDLFromSchema(schemaRef *openapi3.SchemaRef, spec *openapi3.T, sche
 	}
 
 	return "", fmt.Errorf("unsupported schema type: %v", schema.Type)
+}
+
+// GenerateDDLFromObjectSchema generates CREATE TABLE SQL for a marked object schema.
+// It stores only scalar fields from schema and appends relation reference columns.
+func GenerateDDLFromObjectSchema(schema *openapi3.Schema, tableName string, relationColumns []RelationColumnSpec) (string, error) {
+	if schema == nil {
+		return "", fmt.Errorf("schema is nil")
+	}
+	if schema.Type == nil || !schema.Type.Is("object") {
+		return "", fmt.Errorf("schema must be object")
+	}
+
+	table := Table{
+		Name:    tableName,
+		Columns: []Column{},
+	}
+
+	propNames := make([]string, 0, len(schema.Properties))
+	for name := range schema.Properties {
+		propNames = append(propNames, name)
+	}
+	sort.Strings(propNames)
+
+	for _, propName := range propNames {
+		propRef := schema.Properties[propName]
+		if propRef == nil || propRef.Value == nil {
+			continue
+		}
+
+		prop := propRef.Value
+		if prop.Type != nil && (prop.Type.Is("object") || prop.Type.Is("array")) {
+			// In marked mode, unmarked containers are ignored on entity table level.
+			continue
+		}
+
+		colType := goTypeToSQLType(prop.Type, prop.Format)
+		nullable := !contains(schema.Required, propName)
+
+		if ext, ok := prop.Extensions["x-pk"].(bool); ok && ext {
+			table.PrimaryKey = propName
+		}
+
+		table.Columns = append(table.Columns, Column{
+			Name:       propName,
+			Type:       colType,
+			Nullable:   nullable,
+			PrimaryKey: false,
+		})
+	}
+
+	sort.Slice(relationColumns, func(i, j int) bool {
+		return relationColumns[i].Name < relationColumns[j].Name
+	})
+	existingCols := make(map[string]bool, len(table.Columns))
+	for _, col := range table.Columns {
+		existingCols[col.Name] = true
+	}
+	for _, relCol := range relationColumns {
+		if relCol.Name == "" || relCol.Type == "" || existingCols[relCol.Name] {
+			continue
+		}
+		table.Columns = append(table.Columns, Column{
+			Name:       relCol.Name,
+			Type:       relCol.Type,
+			Nullable:   true,
+			PrimaryKey: false,
+		})
+	}
+
+	for i := range table.Columns {
+		table.Columns[i].PrimaryKey = table.Columns[i].Name == table.PrimaryKey
+	}
+
+	return generateCreateTableSQL(table), nil
+}
+
+func GenerateJoinTableDDL(tableName, leftColumn, leftType, rightColumn, rightType string) string {
+	return fmt.Sprintf(
+		"CREATE TABLE %s (\n  %s %s NOT NULL,\n  %s %s NOT NULL,\n  PRIMARY KEY (%s, %s)\n);",
+		tableName,
+		leftColumn, leftType,
+		rightColumn, rightType,
+		leftColumn, rightColumn,
+	)
 }
 
 func generateCreateTableSQL(table Table) string {

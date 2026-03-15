@@ -16,13 +16,20 @@ type fakeAPIConnector struct {
 	mu        sync.Mutex
 	responses map[string]func(req FetchRequest) ([]byte, error)
 	seen      map[string][]string
+	requests  map[string][]FetchRequest
 }
 
 func (f *fakeAPIConnector) Fetch(_ context.Context, req FetchRequest) (FetchResult, error) {
 	if f.seen == nil {
 		f.seen = map[string][]string{}
 	}
+	if f.requests == nil {
+		f.requests = map[string][]FetchRequest{}
+	}
 	key := req.Path
+	f.mu.Lock()
+	f.requests[key] = append(f.requests[key], req)
+	f.mu.Unlock()
 	var marker string
 	if len(req.QueryParams) > 0 {
 		keys := make([]string, 0, len(req.QueryParams))
@@ -192,6 +199,209 @@ func TestGeneratePlanWaitsForLaterDependencyProducer(t *testing.T) {
 	}
 	if !foundInsert {
 		t.Fatalf("expected datasets insert operation in plan")
+	}
+}
+
+func TestGetAuthParamSpecs(t *testing.T) {
+	service := NewService(nil)
+	headerParam := openapi3.NewHeaderParameter("X-Token").WithRequired(true).WithSchema(openapi3.NewStringSchema())
+	headerParam.Extensions = map[string]any{"x-auth": "API_TOKEN"}
+	queryParam := openapi3.NewQueryParameter("api_key").WithSchema(openapi3.NewStringSchema())
+	queryParam.Extensions = map[string]any{"x-auth": "API_KEY"}
+	op := &openapi3.Operation{
+		Parameters: openapi3.Parameters{
+			&openapi3.ParameterRef{Value: headerParam},
+			&openapi3.ParameterRef{Value: queryParam},
+		},
+	}
+
+	specs, err := service.getAuthParamSpecs("/secure", op)
+	if err != nil {
+		t.Fatalf("getAuthParamSpecs returned error: %v", err)
+	}
+	if len(specs) != 2 {
+		t.Fatalf("expected 2 auth specs, got %d", len(specs))
+	}
+	if specs[0].ParamName != "X-Token" || specs[0].In != "header" || specs[0].EnvVar != "API_TOKEN" {
+		t.Fatalf("unexpected header auth spec: %+v", specs[0])
+	}
+	if specs[1].ParamName != "api_key" || specs[1].In != "query" || specs[1].EnvVar != "API_KEY" {
+		t.Fatalf("unexpected query auth spec: %+v", specs[1])
+	}
+}
+
+func TestGetAuthParamSpecsRejectsUnsupportedLocation(t *testing.T) {
+	service := NewService(nil)
+	param := openapi3.NewPathParameter("id").WithRequired(true).WithSchema(openapi3.NewStringSchema())
+	param.Extensions = map[string]any{"x-auth": "API_TOKEN"}
+	op := &openapi3.Operation{
+		Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: param}},
+	}
+
+	_, err := service.getAuthParamSpecs("/secure/{id}", op)
+	if err == nil || !strings.Contains(err.Error(), "supported only for header and query") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGeneratePlanAppliesAuthFromEnv(t *testing.T) {
+	t.Setenv("API_TOKEN", "super-secret")
+
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/secure": func(req FetchRequest) ([]byte, error) {
+				if req.Headers["X-Token"] != "super-secret" {
+					return nil, fmt.Errorf("missing auth header")
+				}
+				return []byte(`[{"id":1,"name":"ok"}]`), nil
+			},
+		},
+	}
+
+	tokenParam := openapi3.NewHeaderParameter("X-Token").WithRequired(true).WithSchema(openapi3.NewStringSchema())
+	tokenParam.Extensions = map[string]any{"x-auth": "API_TOKEN"}
+	op := &openapi3.Operation{
+		Extensions: map[string]any{"x-res-type": "one-shot"},
+		Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: tokenParam}},
+		Responses: responseWithJSONSchema("#/components/schemas/secure", openapi3.NewArraySchema().WithItems(
+			openapi3.NewObjectSchema().
+				WithProperty("id", withPK(openapi3.NewIntegerSchema())).
+				WithProperty("name", openapi3.NewStringSchema()),
+		)),
+	}
+
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths:   openapi3.NewPaths(openapi3.WithPath("/secure", &openapi3.PathItem{Get: op})),
+	}
+
+	service := NewService(api)
+	plan, err := service.GeneratePlan(context.Background(), spec, "https://example.com")
+	if err != nil {
+		t.Fatalf("GeneratePlan returned error: %v", err)
+	}
+	if len(api.requests["/secure"]) != 1 {
+		t.Fatalf("expected one secure request, got %d", len(api.requests["/secure"]))
+	}
+	if api.requests["/secure"][0].Headers["X-Token"] != "super-secret" {
+		t.Fatalf("unexpected auth header: %+v", api.requests["/secure"][0].Headers)
+	}
+	if !api.requests["/secure"][0].SensitiveHeaders["X-Token"] {
+		t.Fatalf("expected auth header to be marked sensitive")
+	}
+
+	foundInsert := false
+	for _, operation := range plan.Operations {
+		insert, ok := operation.(InsertRowsOp)
+		if ok && insert.TableName == "secure" {
+			foundInsert = true
+		}
+	}
+	if !foundInsert {
+		t.Fatalf("expected secure insert operation")
+	}
+}
+
+func TestGeneratePlanSkipsWhenAuthEnvMissing(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/secure": func(req FetchRequest) ([]byte, error) {
+				return []byte(`[{"id":1}]`), nil
+			},
+		},
+	}
+
+	tokenParam := openapi3.NewHeaderParameter("X-Token").WithRequired(true).WithSchema(openapi3.NewStringSchema())
+	tokenParam.Extensions = map[string]any{"x-auth": "MISSING_API_TOKEN"}
+	op := &openapi3.Operation{
+		Extensions: map[string]any{"x-res-type": "one-shot"},
+		Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: tokenParam}},
+		Responses: responseWithJSONSchema("#/components/schemas/secure", openapi3.NewArraySchema().WithItems(
+			openapi3.NewObjectSchema().WithProperty("id", withPK(openapi3.NewIntegerSchema())),
+		)),
+	}
+
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths:   openapi3.NewPaths(openapi3.WithPath("/secure", &openapi3.PathItem{Get: op})),
+	}
+
+	service := NewService(api)
+	plan, err := service.GeneratePlan(context.Background(), spec, "https://example.com")
+	if err != nil {
+		t.Fatalf("GeneratePlan returned error: %v", err)
+	}
+	if len(api.requests["/secure"]) != 0 {
+		t.Fatalf("expected secure operation to be skipped, got %d requests", len(api.requests["/secure"]))
+	}
+	for _, operation := range plan.Operations {
+		insert, ok := operation.(InsertRowsOp)
+		if ok && insert.TableName == "secure" {
+			t.Fatalf("did not expect secure insert operation when auth env is missing")
+		}
+	}
+}
+
+func TestGeneratePlanAuthOverridesFKValue(t *testing.T) {
+	t.Setenv("PUBLICATION_TOKEN", "from-env")
+
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/upstream": func(req FetchRequest) ([]byte, error) {
+				return []byte(`[{"token":"from-upstream"}]`), nil
+			},
+			"/secure": func(req FetchRequest) ([]byte, error) {
+				if req.QueryParams["token"] != "from-env" {
+					return nil, fmt.Errorf("expected env token, got %s", req.QueryParams["token"])
+				}
+				return []byte(`[{"id":1}]`), nil
+			},
+		},
+	}
+
+	tokenField := openapi3.NewStringSchema()
+	tokenField.Extensions = map[string]any{"x-fk": "token"}
+	upstreamOp := &openapi3.Operation{
+		Extensions: map[string]any{"x-res-type": "one-shot"},
+		Responses:  responseWithJSONSchema("#/components/schemas/upstream", openapi3.NewArraySchema().WithItems(openapi3.NewObjectSchema().WithProperty("token", tokenField))),
+	}
+
+	tokenParam := openapi3.NewQueryParameter("token").WithRequired(true).WithSchema(openapi3.NewStringSchema())
+	tokenParam.Extensions = map[string]any{
+		"x-fk":   true,
+		"x-auth": "PUBLICATION_TOKEN",
+	}
+	secureOp := &openapi3.Operation{
+		Extensions: map[string]any{"x-res-type": "one-shot"},
+		Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: tokenParam}},
+		Responses: responseWithJSONSchema("#/components/schemas/secure", openapi3.NewArraySchema().WithItems(
+			openapi3.NewObjectSchema().WithProperty("id", withPK(openapi3.NewIntegerSchema())),
+		)),
+	}
+
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/secure", &openapi3.PathItem{Get: secureOp}),
+			openapi3.WithPath("/upstream", &openapi3.PathItem{Get: upstreamOp}),
+		),
+	}
+
+	service := NewService(api)
+	if _, err := service.GeneratePlan(context.Background(), spec, "https://example.com"); err != nil {
+		t.Fatalf("GeneratePlan returned error: %v", err)
+	}
+	if len(api.requests["/secure"]) != 1 {
+		t.Fatalf("expected one secure request, got %d", len(api.requests["/secure"]))
+	}
+	if api.requests["/secure"][0].QueryParams["token"] != "from-env" {
+		t.Fatalf("expected x-auth to override x-fk, got %q", api.requests["/secure"][0].QueryParams["token"])
+	}
+	if !api.requests["/secure"][0].SensitiveQuery["token"] {
+		t.Fatalf("expected auth query param to be marked sensitive")
 	}
 }
 

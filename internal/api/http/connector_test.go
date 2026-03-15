@@ -73,6 +73,55 @@ func TestConnectorBuildsRequestAndLogs(t *testing.T) {
 	}
 }
 
+func TestConnectorRedactsSensitiveAuthParamsInLogs(t *testing.T) {
+	logger := &collectingLogger{}
+	cfg := config.APIConfig{
+		MaxRPM:         1000,
+		RequestTimeout: time.Second,
+		Retries: config.RetryConfig{
+			ErrorsMaxRetries:  0,
+			BasicRetryTimeout: time.Millisecond,
+		},
+	}
+	client := &nethttp.Client{
+		Transport: roundTripFunc(func(req *nethttp.Request) (*nethttp.Response, error) {
+			return &nethttp.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewBufferString(`{"ok":true}`)),
+				Header:     make(nethttp.Header),
+			}, nil
+		}),
+	}
+
+	conn := newConnector(cfg, logger, client)
+	_, err := conn.Fetch(context.Background(), core.FetchRequest{
+		Method:           nethttp.MethodGet,
+		BaseURL:          "https://api.example.com",
+		Path:             "/users",
+		QueryParams:      map[string]string{"api_key": "query-secret", "expand": "full"},
+		Headers:          map[string]string{"X-Token": "header-secret"},
+		SensitiveQuery:   map[string]bool{"api_key": true},
+		SensitiveHeaders: map[string]bool{"X-Token": true},
+	})
+	if err != nil {
+		t.Fatalf("Fetch returned error: %v", err)
+	}
+
+	if len(logger.events) != 1 {
+		t.Fatalf("expected one log event, got %d", len(logger.events))
+	}
+	params := logger.events[0].Params
+	if params["api_key"] != "***" {
+		t.Fatalf("expected query auth param to be redacted, got %q", params["api_key"])
+	}
+	if params["X-Token"] != "***" {
+		t.Fatalf("expected header auth param to be redacted, got %q", params["X-Token"])
+	}
+	if params["expand"] != "full" {
+		t.Fatalf("expected non-sensitive param to remain visible, got %q", params["expand"])
+	}
+}
+
 func TestConnectorRetriesOnServerError(t *testing.T) {
 	attempts := 0
 	cfg := config.APIConfig{

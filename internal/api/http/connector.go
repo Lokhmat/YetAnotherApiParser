@@ -195,9 +195,17 @@ func combineRequestParams(req core.FetchRequest) map[string]string {
 		result[k] = v
 	}
 	for k, v := range req.QueryParams {
+		if req.SensitiveQuery[k] {
+			result[k] = "***"
+			continue
+		}
 		result[k] = v
 	}
 	for k, v := range req.Headers {
+		if req.SensitiveHeaders[k] {
+			result[k] = "***"
+			continue
+		}
 		result[k] = v
 	}
 	return result

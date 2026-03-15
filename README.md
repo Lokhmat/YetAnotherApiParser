@@ -1,6 +1,13 @@
 # API Parser
 
-`api-parser` reads an OpenAPI spec, fetches selected API endpoints, and generates PostgreSQL SQL:
+`api-parser` reads an OpenAPI spec, fetches selected API endpoints, builds a database-agnostic migration plan, and executes it through a configured database adapter.
+
+Current built-in providers:
+
+- API provider: `openapi_http`
+- DB provider: `postgres`
+
+With the default Postgres adapter it still generates PostgreSQL SQL such as:
 
 - `CREATE TABLE ...`
 - `INSERT INTO ...`
@@ -10,12 +17,13 @@ It can:
 - resolve endpoint dependencies with `x-fk`
 - fetch in dependency order
 - flatten marked nested response objects into separate tables (`x-table-name`)
-- save/apply migrations
-- write request run logs to `runlog.log`
+- export SQL through the DB adapter
+- apply migrations directly to DB
+- write request run logs to a configurable path
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.22+
 - PostgreSQL (optional; if DB is unavailable, SQL is still written to file)
 
 ## Configuration
@@ -23,10 +31,14 @@ It can:
 Create `conf.yaml`:
 
 ```yaml
-database:
-  connection_string: "host=localhost port=5440 user=postgres password=postgres dbname=api_parser"
+openapi_path: "example/api.json"
+
+runtime:
+  sql_output_path: "res.sql"
+  run_log_path: "runlog.log"
 
 api:
+  provider: "openapi_http"
   base_url: "https://api.example.com"
   max_rpm: 60
   request_timeout: 30  # seconds
@@ -34,8 +46,18 @@ api:
     errors_max_retries: 3
     basic_retry_timeout: 2  # seconds
 
-openapi_path: "example/api.json"
+database:
+  provider: "postgres"
+  connection_string: "host=localhost port=5440 user=postgres password=postgres dbname=api_parser"
 ```
+
+Compatibility notes:
+
+- `api.provider` defaults to `openapi_http`
+- `database.provider` defaults to `postgres`
+- `runtime.sql_output_path` defaults to `res.sql`
+- `runtime.run_log_path` defaults to `runlog.log`
+- old config files without `provider` or `runtime` sections still work
 
 ## Run
 
@@ -45,10 +67,23 @@ go run ./cmd/main.go -config conf.yaml
 
 Behavior:
 
-1. Load config + OpenAPI spec.
-2. Generate DDL/INSERT statements.
-3. Try applying statements to DB.
-4. If DB connection fails, write SQL to `res.sql`.
+1. Load config and instantiate the selected API and DB providers.
+2. Load the OpenAPI spec.
+3. Build a structured migration plan from fetched API data.
+4. Export SQL through the configured DB adapter.
+5. Try applying the migration plan to DB.
+6. If DB apply fails, write exported SQL to `runtime.sql_output_path`.
+
+## Architecture Overview
+
+The project is now split into four main modules:
+
+- `internal/config`: typed config loading, defaults, runtime paths, provider selection
+- `internal/api`: API connector registry and networking implementations
+- `internal/core`: fetch planning, FK resolution, extraction, and migration-plan building
+- `internal/db`: DB target registry and provider-specific execution/SQL export
+
+Connectors are compiled into the binary and selected by config.
 
 ## Extension Reference
 
@@ -142,7 +177,7 @@ Important for arrays:
 
 ## Run Log
 
-Each HTTP request appends one line to `runlog.log` in current working directory:
+Each HTTP request appends one line to `runtime.run_log_path`:
 
 - timestamp (RFC3339)
 - method
@@ -167,9 +202,9 @@ Example line:
 
 ## Outputs
 
-- `res.sql` (when DB apply is skipped/failed, or when you inspect generated SQL)
-- DB migrations applied directly (if DB connection succeeds)
-- `runlog.log` (request trace)
+- SQL export file at `runtime.sql_output_path` when DB apply fails
+- DB migrations applied directly when DB execution succeeds
+- request trace log at `runtime.run_log_path`
 
 ## Project Examples
 

@@ -6,13 +6,14 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
-	"time"
 
+	"api-parser/internal/api"
+	_ "api-parser/internal/api/http"
 	"api-parser/internal/config"
-	"api-parser/internal/database"
-	"api-parser/internal/fetcher"
-	"api-parser/internal/migration"
+	"api-parser/internal/core"
+	"api-parser/internal/db"
+	_ "api-parser/internal/db/postgres"
+	"api-parser/internal/observability"
 	"api-parser/internal/openapi"
 )
 
@@ -25,6 +26,16 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	logger := observability.NewFileRequestLogger(cfg.Runtime.RunLogPath)
+	apiConnector, err := api.New(cfg.API.Provider, cfg.API, logger)
+	if err != nil {
+		log.Fatalf("build api provider: %v", err)
+	}
+	dbTarget, err := db.New(cfg.Database.Provider, cfg.Database)
+	if err != nil {
+		log.Fatalf("build db provider: %v", err)
+	}
+
 	spec, err := openapi.Load(context.Background(), cfg.OpenAPIPath)
 	if err != nil {
 		log.Fatalf("load openapi: %v", err)
@@ -32,61 +43,33 @@ func main() {
 
 	fmt.Printf("Base URL: %s\n", cfg.API.BaseURL)
 
-	// Generate migrations with rate limiting
-	maxRPM := cfg.API.MaxRPM
-	if maxRPM <= 0 {
-		maxRPM = 60 // default to 60 requests per minute
-	}
-	requestTimeout := time.Duration(cfg.API.RequestTimeout) * time.Second
-	if requestTimeout <= 0 {
-		requestTimeout = 30 * time.Second
-	}
-	basicRetryTimeout := time.Duration(cfg.API.Retries.BasicRetryTimeout) * time.Second
-	if basicRetryTimeout <= 0 {
-		basicRetryTimeout = 1 * time.Second
-	}
-	errorsMaxRetries := cfg.API.Retries.ErrorsMaxRetries
-	if errorsMaxRetries < 0 {
-		errorsMaxRetries = 0
-	}
-	mig := migration.New(maxRPM, fetcher.ClientConfig{
-		RequestTimeout:    requestTimeout,
-		ErrorsMaxRetries:  errorsMaxRetries,
-		BasicRetryTimeout: basicRetryTimeout,
-	})
-	migrations, err := mig.GenerateMigrations(context.Background(), spec, cfg.API.BaseURL)
+	service := core.NewService(apiConnector)
+	plan, err := service.GeneratePlan(context.Background(), spec, cfg.API.BaseURL)
 	if err != nil {
-		log.Fatalf("generate migrations: %v", err)
+		log.Fatalf("generate migration plan: %v", err)
 	}
 
-	fmt.Printf("\nGenerated %d migrations:\n", len(migrations))
-	for i, ddl := range migrations {
-		fmt.Printf("\nMigration %d:\n%s\n", i+1, ddl)
-	}
-
-	// Apply migrations to database
-	db, err := database.New(cfg.Database.ConnectionString)
+	sqlBytes, err := dbTarget.ExportSQL(plan)
 	if err != nil {
-		log.Printf("database connection failed: %v", err)
-		log.Println("Saving migrations to res.sql file...")
+		log.Fatalf("export sql: %v", err)
+	}
 
-		// Write migrations to file
-		if len(migrations) > 0 {
-			err := os.WriteFile("res.sql", []byte(strings.Join(migrations, "\n\n")), 0644)
-			if err != nil {
+	fmt.Printf("\nGenerated %d operations:\n", len(plan.Operations))
+	if len(sqlBytes) > 0 {
+		fmt.Printf("\n%s\n", string(sqlBytes))
+	}
+
+	result, err := dbTarget.Apply(context.Background(), plan)
+	if err != nil {
+		log.Printf("database apply failed: %v", err)
+		log.Printf("saving migrations to %s...", cfg.Runtime.SQLOutputPath)
+		if len(sqlBytes) > 0 {
+			if err := os.WriteFile(cfg.Runtime.SQLOutputPath, sqlBytes, 0644); err != nil {
 				log.Fatalf("failed to write migrations to file: %v", err)
 			}
-			fmt.Println("Migrations saved to res.sql")
+			fmt.Printf("Migrations saved to %s\n", cfg.Runtime.SQLOutputPath)
 		}
 		return
 	}
-	defer db.Close()
-
-	for i, ddl := range migrations {
-		if err := db.Exec(ddl); err != nil {
-			log.Printf("failed to apply migration %d: %v", i+1, err)
-			continue
-		}
-		fmt.Printf("Applied migration %d\n", i+1)
-	}
+	fmt.Printf("Applied %d migrations\n", result.AppliedCount)
 }

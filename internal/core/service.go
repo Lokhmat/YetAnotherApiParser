@@ -1,4 +1,4 @@
-package migration
+package core
 
 import (
 	"context"
@@ -10,25 +10,15 @@ import (
 	"strings"
 	"time"
 
-	"api-parser/internal/ddl"
-	"api-parser/internal/fetcher"
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
-type MigrationGenerator struct {
-	fetcher *fetcher.Fetcher
-	maxRPM  int
+type Service struct {
+	api APIConnector
 }
 
-func New(maxRPM int, fetcherCfgs ...fetcher.ClientConfig) *MigrationGenerator {
-	var fetcherCfg fetcher.ClientConfig
-	if len(fetcherCfgs) > 0 {
-		fetcherCfg = fetcherCfgs[0]
-	}
-	return &MigrationGenerator{
-		fetcher: fetcher.New(maxRPM, fetcherCfg),
-		maxRPM:  maxRPM,
-	}
+func NewService(api APIConnector) *Service {
+	return &Service{api: api}
 }
 
 type containerKind string
@@ -66,23 +56,22 @@ type FKParamSpec struct {
 	Filter        *FKFilterSpec
 }
 
-// OperationInfo holds information about an operation with its x-fk dependencies
-type OperationInfo struct {
+type operationInfo struct {
 	Path      string
 	Op        *openapi3.Operation
 	FKSpecs   []FKParamSpec
-	IsFetched bool // whether this operation has been fetched (with all required FK values)
-	Plan      *OperationExtractionPlan
+	IsFetched bool
+	Plan      *operationExtractionPlan
 }
 
-type RelationColumnPlan struct {
+type relationColumnPlan struct {
 	Name     string
 	Type     string
 	IsArray  bool
 	ElemType string
 }
 
-type MarkedNodePlan struct {
+type markedNodePlan struct {
 	Path            string
 	TableName       string
 	PKField         string
@@ -94,10 +83,10 @@ type MarkedNodePlan struct {
 	ParentProp      string
 	ParentNodeKind  containerKind
 	ScalarColumns   []string
-	RelationColumns map[string]RelationColumnPlan
+	RelationColumns map[string]relationColumnPlan
 }
 
-type RelationPlan struct {
+type relationPlan struct {
 	Kind           relationKind
 	ParentPath     string
 	ChildPath      string
@@ -108,12 +97,8 @@ type RelationPlan struct {
 	ParentProp     string
 	ParentNodeKind containerKind
 	ChildNodeKind  containerKind
-
-	// direct ref fields
-	RefSQLType string
-	IsArrayRef bool
-
-	// link table fields
+	RefSQLType     string
+	IsArrayRef     bool
 	JoinTableName  string
 	JoinParentCol  string
 	JoinParentType string
@@ -121,55 +106,87 @@ type RelationPlan struct {
 	JoinChildType  string
 }
 
-type OperationExtractionPlan struct {
+type operationExtractionPlan struct {
 	HasMarks       bool
-	Nodes          []*MarkedNodePlan
-	NodeByPath     map[string]*MarkedNodePlan
-	ChildRelations map[string][]*RelationPlan
-	Relations      []*RelationPlan
+	Nodes          []*markedNodePlan
+	NodeByPath     map[string]*markedNodePlan
+	ChildRelations map[string][]*relationPlan
+	Relations      []*relationPlan
 }
 
 var sqlIdentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// GenerateMigrations generates migration DDL statements from OpenAPI specification
-func (m *MigrationGenerator) GenerateMigrations(ctx context.Context, spec *openapi3.T, baseURL string) ([]string, error) {
-	var migrations []string
-
-	// 1. Get all operations with x-res-type and build operation dependencies map
-	// operationDependencies: operation path -> operation info (x-fk dependencies, fetch status)
-	operationDependencies := make(map[string]*OperationInfo)
-
-	// generatedTables: tracks which table names have already been created
+func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL string) (*MigrationPlan, error) {
+	plan := &MigrationPlan{}
+	operationDependencies := make(map[string]*operationInfo)
 	generatedTables := make(map[string]bool)
 
-	operations := m.collectOperationsWithResType(spec)
+	operations := s.collectOperationsWithResType(spec)
 	for _, opInfo := range operations {
-		path := opInfo.path
-		op := opInfo.op
-
-		fkSpecs, err := m.getFKParamSpecs(path, op)
+		fkSpecs, err := s.getFKParamSpecs(opInfo.path, opInfo.op)
 		if err != nil {
-			return nil, fmt.Errorf("parse x-fk for %s: %w", path, err)
+			return nil, fmt.Errorf("parse x-fk for %s: %w", opInfo.path, err)
 		}
-		plan, err := m.buildOperationExtractionPlan(op)
+		extractionPlan, err := s.buildOperationExtractionPlan(opInfo.op)
 		if err != nil {
-			return nil, fmt.Errorf("build extraction plan for %s: %w", path, err)
+			return nil, fmt.Errorf("build extraction plan for %s: %w", opInfo.path, err)
 		}
 
-		operationDependencies[path] = &OperationInfo{
-			Path:      path,
-			Op:        op,
+		operationDependencies[opInfo.path] = &operationInfo{
+			Path:      opInfo.path,
+			Op:        opInfo.op,
 			FKSpecs:   fkSpecs,
+			Plan:      extractionPlan,
 			IsFetched: false,
-			Plan:      plan,
 		}
+
+		if extractionPlan != nil && extractionPlan.HasMarks {
+			for _, node := range extractionPlan.Nodes {
+				if generatedTables[node.TableName] {
+					continue
+				}
+				plan.Add(buildCreateTableOpFromMarkedNode(node, s.getRelationColumnsForNode(extractionPlan, node.Path)))
+				generatedTables[node.TableName] = true
+			}
+			for _, rel := range extractionPlan.Relations {
+				if rel.Kind != relationLinkTable || generatedTables[rel.JoinTableName] {
+					continue
+				}
+				plan.Add(CreateLinkTableOp{
+					TableName:   rel.JoinTableName,
+					LeftColumn:  rel.JoinParentCol,
+					LeftType:    rel.JoinParentType,
+					RightColumn: rel.JoinChildCol,
+					RightType:   rel.JoinChildType,
+					PrimaryKey:  []string{rel.JoinParentCol, rel.JoinChildCol},
+				})
+				generatedTables[rel.JoinTableName] = true
+			}
+			continue
+		}
+
+		resp := s.getSuccessResponse(opInfo.op)
+		if resp == nil || resp.Value == nil {
+			continue
+		}
+		media := resp.Value.Content.Get("application/json")
+		if media == nil || media.Schema == nil {
+			continue
+		}
+		schemaName := s.getSchemaName(media.Schema)
+		if schemaName == "" || generatedTables[schemaName] {
+			continue
+		}
+		createTable, err := buildCreateTableOpFromSchema(media.Schema, schemaName)
+		if err != nil {
+			return nil, fmt.Errorf("build create table for %s: %w", opInfo.path, err)
+		}
+		plan.Add(createTable)
+		generatedTables[schemaName] = true
 	}
 
-	// 2. Create map B: FK name -> slice of all fetched values
-	// fetchedFKValues: tracks all FK values we've collected so far
 	fetchedFKValues := make(map[string][]interface{})
 
-	// 3. Start infinite loop - fetch operations when all their dependencies are met
 	for {
 		shouldContinue := false
 
@@ -179,10 +196,8 @@ func (m *MigrationGenerator) GenerateMigrations(ctx context.Context, spec *opena
 		}
 		sort.Strings(paths)
 
-		// 4. Iterate through all operations
 		for _, path := range paths {
 			opInfo := operationDependencies[path]
-			// Skip if already fetched
 			if opInfo.IsFetched {
 				continue
 			}
@@ -191,108 +206,179 @@ func (m *MigrationGenerator) GenerateMigrations(ctx context.Context, spec *opena
 			if len(opInfo.FKSpecs) == 0 {
 				combinations = [][]interface{}{{}}
 			} else {
-				fkValueLists, ready, err := m.buildEffectiveFKValueLists(path, opInfo.FKSpecs, fetchedFKValues)
+				fkValueLists, ready, err := s.buildEffectiveFKValueLists(path, opInfo.FKSpecs, fetchedFKValues)
 				if err != nil {
 					return nil, err
 				}
 				if !ready {
-					opInfo.IsFetched = true
 					continue
 				}
-				combinations = m.generateCombinations(fkValueLists)
+				combinations = s.generateCombinations(fkValueLists)
 			}
 
-			if combinations != nil && len(combinations) > 0 {
-				if opInfo.Plan != nil && opInfo.Plan.HasMarks {
-					for _, node := range opInfo.Plan.Nodes {
-						if generatedTables[node.TableName] {
-							continue
-						}
-						relationCols := m.getRelationColumnsForNode(opInfo.Plan, node.Path)
-						ddlStr, err := ddl.GenerateDDLFromObjectSchema(node.Schema, node.TableName, relationCols)
-						if err != nil {
-							return nil, fmt.Errorf("generate marked DDL for %s: %w", node.TableName, err)
-						}
-						migrations = append(migrations, ddlStr)
-						generatedTables[node.TableName] = true
-					}
-					for _, rel := range opInfo.Plan.Relations {
-						if rel.Kind != relationLinkTable {
-							continue
-						}
-						if generatedTables[rel.JoinTableName] {
-							continue
-						}
-						migrations = append(migrations, ddl.GenerateJoinTableDDL(
-							rel.JoinTableName,
-							rel.JoinParentCol,
-							rel.JoinParentType,
-							rel.JoinChildCol,
-							rel.JoinChildType,
-						))
-						generatedTables[rel.JoinTableName] = true
-					}
-				} else {
-					resp := m.getSuccessResponse(opInfo.Op)
-					var schemaName string
-					if resp != nil && resp.Value != nil {
-						media := resp.Value.Content.Get("application/json")
-						if media != nil && media.Schema != nil {
-							schemaName = m.getSchemaName(media.Schema)
-						}
-					}
-
-					// Generate CREATE TABLE only once per unique table
-					if schemaName != "" && !generatedTables[schemaName] {
-						media := resp.Value.Content.Get("application/json")
-						if media == nil || media.Schema == nil {
-							log.Printf("Failed to generate CREATE TABLE for %s: missing JSON schema", path)
-							continue
-						}
-						ddlStr, err := ddl.GenerateDDLFromSchema(
-							media.Schema,
-							spec,
-							schemaName,
-						)
-						if err != nil {
-							log.Printf("Failed to generate CREATE TABLE for %s: %v", path, err)
-						} else if ddlStr != "" {
-							migrations = append(migrations, ddlStr)
-							generatedTables[schemaName] = true
-						}
-					}
-				}
-
-				// Fetch data and generate INSERT statements for each combination
+			if len(combinations) > 0 {
 				for _, combo := range combinations {
-					params := m.buildParamsMapFromSpecs(opInfo.FKSpecs, combo)
-					insertSQL, err := m.FetchDataAndGenerateInserts(ctx, baseURL, path, opInfo.Op, params, spec, fetchedFKValues, opInfo.Plan)
+					params := s.buildParamsMapFromSpecs(opInfo.FKSpecs, combo)
+					insertOps, err := s.fetchAndBuildInsertOps(ctx, baseURL, path, opInfo.Op, params, fetchedFKValues, opInfo.Plan)
 					if err != nil {
-						log.Printf("Failed to generate INSERT for %s %s: %v", "GET", path, err)
+						log.Printf("failed to build INSERT ops for GET %s: %v", path, err)
 						continue
 					}
-					if insertSQL != "" {
-						migrations = append(migrations, insertSQL)
+					for _, op := range insertOps {
+						plan.Add(op)
 					}
 				}
 				shouldContinue = true
 			}
 
-			// Mark as fetched
 			opInfo.IsFetched = true
 		}
 
-		// 5. If no operations were fetched in this iteration, break
 		if !shouldContinue {
 			break
 		}
-
 	}
 
-	return migrations, nil
+	return plan, nil
 }
 
-func (m *MigrationGenerator) getSchemaName(schemaRef *openapi3.SchemaRef) string {
+func buildCreateTableOpFromSchema(schemaRef *openapi3.SchemaRef, tableName string) (CreateTableOp, error) {
+	if schemaRef == nil || schemaRef.Value == nil {
+		return CreateTableOp{}, fmt.Errorf("schema is nil")
+	}
+
+	schema := schemaRef.Value
+	if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil {
+		return buildCreateTableOpFromSchema(schema.Items, tableName)
+	}
+	if schema.Type == nil || !schema.Type.Is("object") || schema.Properties == nil {
+		return CreateTableOp{}, fmt.Errorf("unsupported schema type: %v", schema.Type)
+	}
+
+	op := CreateTableOp{TableName: tableName}
+	for _, propName := range sortedPropertyNames(schema) {
+		propRef := schema.Properties[propName]
+		if propRef == nil || propRef.Value == nil {
+			continue
+		}
+		primaryKey := false
+		if ext, ok := propRef.Value.Extensions["x-pk"].(bool); ok && ext {
+			primaryKey = true
+		}
+		op.Columns = append(op.Columns, Column{
+			Name:       propName,
+			Type:       inferSQLType(propRef.Value.Type, propRef.Value.Format),
+			Nullable:   !contains(schema.Required, propName),
+			PrimaryKey: primaryKey,
+		})
+	}
+	return op, nil
+}
+
+func buildCreateTableOpFromMarkedNode(node *markedNodePlan, relationColumns []Column) CreateTableOp {
+	op := CreateTableOp{TableName: node.TableName}
+	for _, propName := range sortedPropertyNames(node.Schema) {
+		propRef := node.Schema.Properties[propName]
+		if propRef == nil || propRef.Value == nil {
+			continue
+		}
+		if propRef.Value.Type != nil && (propRef.Value.Type.Is("object") || propRef.Value.Type.Is("array")) {
+			continue
+		}
+		op.Columns = append(op.Columns, Column{
+			Name:       propName,
+			Type:       inferSQLType(propRef.Value.Type, propRef.Value.Format),
+			Nullable:   !contains(node.Schema.Required, propName),
+			PrimaryKey: node.PKField == propName,
+		})
+	}
+	op.Columns = append(op.Columns, relationColumns...)
+	sort.Slice(op.Columns, func(i, j int) bool { return op.Columns[i].Name < op.Columns[j].Name })
+	return op
+}
+
+func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, fetchedFKValues map[string][]interface{}, plan *operationExtractionPlan) ([]MigrationOperation, error) {
+	resp := s.getSuccessResponse(op)
+	if resp == nil || resp.Value == nil {
+		return nil, fmt.Errorf("no successful response found")
+	}
+
+	media := resp.Value.Content.Get("application/json")
+	if media == nil || media.Schema == nil {
+		return nil, fmt.Errorf("no JSON response schema found")
+	}
+
+	request, err := buildFetchRequest(baseURL, path, op, params)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.api.Fetch(ctx, request)
+	if err != nil {
+		log.Printf("warning: failed to fetch data for %s: %v", path, err)
+		return nil, nil
+	}
+
+	s.extractFKValuesFromData(result.Payload, op, media, fetchedFKValues)
+	s.extractFKValuesFromMarkedData(result.Payload, media.Schema, fetchedFKValues)
+
+	if plan != nil && plan.HasMarks {
+		insertOps, err := s.buildInsertOpsFromMarkedPlan(result.Payload, plan)
+		if err != nil {
+			log.Printf("warning: failed to build marked INSERT operations: %v", err)
+			return nil, nil
+		}
+		return insertOps, nil
+	}
+
+	schemaName := s.getSchemaName(media.Schema)
+	expectedColumns := s.getExpectedColumns(resp)
+	insertOp, err := s.buildInsertRowsOp(result.Payload, schemaName, expectedColumns)
+	if err != nil {
+		log.Printf("warning: failed to build INSERT operations: %v", err)
+		return nil, nil
+	}
+	if len(insertOp.Rows) == 0 {
+		return nil, nil
+	}
+	return []MigrationOperation{insertOp}, nil
+}
+
+func buildFetchRequest(baseURL, path string, op *openapi3.Operation, params map[string]string) (FetchRequest, error) {
+	req := FetchRequest{
+		Method:      "GET",
+		BaseURL:     baseURL,
+		Path:        path,
+		PathParams:  map[string]string{},
+		QueryParams: map[string]string{},
+		Headers:     map[string]string{},
+	}
+
+	for _, paramRef := range op.Parameters {
+		if paramRef == nil || paramRef.Value == nil {
+			continue
+		}
+		p := paramRef.Value
+		val, ok := params[p.Name]
+		if !ok {
+			if p.Required {
+				return FetchRequest{}, fmt.Errorf("missing required %s parameter: %s", p.In, p.Name)
+			}
+			continue
+		}
+
+		switch p.In {
+		case "path":
+			req.PathParams[p.Name] = val
+		case "query":
+			req.QueryParams[p.Name] = val
+		case "header":
+			req.Headers[p.Name] = val
+		}
+	}
+	return req, nil
+}
+
+func (s *Service) getSchemaName(schemaRef *openapi3.SchemaRef) string {
 	schemaName := "response"
 	if schemaRef != nil && schemaRef.Ref != "" {
 		parts := strings.Split(schemaRef.Ref, "/")
@@ -303,8 +389,7 @@ func (m *MigrationGenerator) getSchemaName(schemaRef *openapi3.SchemaRef) string
 	return schemaName
 }
 
-// collectOperationsWithResType returns all GET operations with x-res-type extension
-func (m *MigrationGenerator) collectOperationsWithResType(spec *openapi3.T) []struct {
+func (s *Service) collectOperationsWithResType(spec *openapi3.T) []struct {
 	path string
 	op   *openapi3.Operation
 } {
@@ -312,27 +397,22 @@ func (m *MigrationGenerator) collectOperationsWithResType(spec *openapi3.T) []st
 		path string
 		op   *openapi3.Operation
 	}
-
 	for path, pathItem := range spec.Paths.Map() {
 		if pathItem == nil || pathItem.Get == nil {
 			continue
 		}
-
-		op := pathItem.Get
-		if _, ok := op.Extensions["x-res-type"]; ok {
+		if _, ok := pathItem.Get.Extensions["x-res-type"]; ok {
 			operations = append(operations, struct {
 				path string
 				op   *openapi3.Operation
-			}{path: path, op: op})
+			}{path: path, op: pathItem.Get})
 		}
 	}
-
 	sort.Slice(operations, func(i, j int) bool { return operations[i].path < operations[j].path })
 	return operations
 }
 
-// getFKParamSpecs returns normalized x-fk parameter configs for an operation.
-func (m *MigrationGenerator) getFKParamSpecs(opPath string, op *openapi3.Operation) ([]FKParamSpec, error) {
+func (s *Service) getFKParamSpecs(opPath string, op *openapi3.Operation) ([]FKParamSpec, error) {
 	var specs []FKParamSpec
 	for _, paramRef := range op.Parameters {
 		if paramRef == nil || paramRef.Value == nil {
@@ -355,8 +435,7 @@ func (m *MigrationGenerator) getFKParamSpecs(opPath string, op *openapi3.Operati
 	return specs, nil
 }
 
-// buildParamsMapFromSpecs builds a params map from FK specs and values.
-func (m *MigrationGenerator) buildParamsMapFromSpecs(specs []FKParamSpec, values []interface{}) map[string]string {
+func (s *Service) buildParamsMapFromSpecs(specs []FKParamSpec, values []interface{}) map[string]string {
 	params := make(map[string]string)
 	for i, fk := range specs {
 		params[fk.ParamName] = fmt.Sprintf("%v", values[i])
@@ -364,7 +443,7 @@ func (m *MigrationGenerator) buildParamsMapFromSpecs(specs []FKParamSpec, values
 	return params
 }
 
-func (m *MigrationGenerator) buildEffectiveFKValueLists(opPath string, specs []FKParamSpec, fetchedFKValues map[string][]interface{}) ([][]interface{}, bool, error) {
+func (s *Service) buildEffectiveFKValueLists(opPath string, specs []FKParamSpec, fetchedFKValues map[string][]interface{}) ([][]interface{}, bool, error) {
 	fkValueLists := make([][]interface{}, 0, len(specs))
 	for _, fk := range specs {
 		values := make([]interface{}, 0, len(fk.SeedValues))
@@ -383,44 +462,34 @@ func (m *MigrationGenerator) buildEffectiveFKValueLists(opPath string, specs []F
 		}
 		fkValueLists = append(fkValueLists, filtered)
 	}
-
 	return fkValueLists, true, nil
 }
 
-// generateCombinations generates all combinations from multiple value lists
-func (m *MigrationGenerator) generateCombinations(valueLists [][]interface{}) [][]interface{} {
+func (s *Service) generateCombinations(valueLists [][]interface{}) [][]interface{} {
 	if len(valueLists) == 0 {
 		return nil
 	}
-
-	// Start with the first list
 	result := make([][]interface{}, 0)
 	for _, v := range valueLists[0] {
 		result = append(result, []interface{}{v})
 	}
-
-	// For each subsequent list, combine with existing results
 	for i := 1; i < len(valueLists); i++ {
-		newResult := make([][]interface{}, 0)
+		next := make([][]interface{}, 0)
 		for _, combo := range result {
-			for _, v := range valueLists[i] {
+			for _, value := range valueLists[i] {
 				newCombo := make([]interface{}, len(combo)+1)
 				copy(newCombo, combo)
-				newCombo[len(combo)] = v
-				newResult = append(newResult, newCombo)
+				newCombo[len(combo)] = value
+				next = append(next, newCombo)
 			}
 		}
-		result = newResult
+		result = next
 	}
-
 	return result
 }
 
-// findFKFields finds fields with x-fk extension in the operation parameters and response schema
-func (m *MigrationGenerator) findFKFields(op *openapi3.Operation, media *openapi3.MediaType, spec *openapi3.T) map[string]string {
-	fkFieldNames := make(map[string]string) // map of parameter name -> response field name
-
-	// First, check parameter extensions for x-fk
+func (s *Service) findFKFields(op *openapi3.Operation, media *openapi3.MediaType) map[string]string {
+	fkFieldNames := make(map[string]string)
 	for _, paramRef := range op.Parameters {
 		if paramRef == nil || paramRef.Value == nil {
 			continue
@@ -430,7 +499,6 @@ func (m *MigrationGenerator) findFKFields(op *openapi3.Operation, media *openapi
 			if err != nil {
 				continue
 			}
-			// For parameter-level x-fk mapping we read from dependency key field in response.
 			fkFieldNames[fkSpec.DependencyKey] = fkSpec.DependencyKey
 		}
 	}
@@ -439,14 +507,9 @@ func (m *MigrationGenerator) findFKFields(op *openapi3.Operation, media *openapi
 	if schema == nil {
 		return fkFieldNames
 	}
-
-	// Handle array type - get the items schema
 	if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil {
 		schema = schema.Items.Value
 	}
-
-	// Check schema properties for x-fk extensions.
-	// x-fk value is the dependency key; property name is where to read it from response JSON.
 	if schema != nil && schema.Properties != nil {
 		for propName, propRef := range schema.Properties {
 			if propRef == nil || propRef.Value == nil {
@@ -460,33 +523,24 @@ func (m *MigrationGenerator) findFKFields(op *openapi3.Operation, media *openapi
 			}
 		}
 	}
-
 	return fkFieldNames
 }
 
-// getExpectedColumns extracts column names from the response schema
-func (m *MigrationGenerator) getExpectedColumns(resp *openapi3.ResponseRef, spec *openapi3.T) []string {
+func (s *Service) getExpectedColumns(resp *openapi3.ResponseRef) []string {
 	if resp == nil || resp.Value == nil {
 		return nil
 	}
-
 	media := resp.Value.Content.Get("application/json")
 	if media == nil || media.Schema == nil {
 		return nil
 	}
-
-	// Start with the schema
 	schema := media.Schema.Value
 	if schema == nil {
 		return nil
 	}
-
-	// Handle array type - get the items schema
 	if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil {
 		schema = schema.Items.Value
 	}
-
-	// Extract column names from schema properties
 	var columns []string
 	if schema != nil && schema.Properties != nil {
 		for propName := range schema.Properties {
@@ -497,99 +551,36 @@ func (m *MigrationGenerator) getExpectedColumns(resp *openapi3.ResponseRef, spec
 	return columns
 }
 
-// generateInsertStatements generates INSERT statements from JSON data
-// Only includes columns that are expected (defined in schema) to avoid unexpected fields from API
-func (m *MigrationGenerator) generateInsertStatements(data []byte, tableName string, expectedColumns []string) (string, error) {
+func (s *Service) buildInsertRowsOp(data []byte, tableName string, expectedColumns []string) (InsertRowsOp, error) {
 	records, err := parseJSONRecords(data)
 	if err != nil {
-		return "", fmt.Errorf("unmarshal JSON: %w", err)
+		return InsertRowsOp{}, fmt.Errorf("unmarshal JSON: %w", err)
 	}
-
-	var b strings.Builder
+	op := InsertRowsOp{TableName: tableName}
 	for _, record := range records {
-		var columns []string
-		var values []string
-
-		// Only include columns that are expected (defined in schema)
+		row := InsertRow{}
 		for _, colName := range expectedColumns {
 			if value, exists := record[colName]; exists {
-				columns = append(columns, colName)
-				values = append(values, toSQLLiteral(value))
+				row.Columns = append(row.Columns, colName)
+				row.Values = append(row.Values, Value{Scalar: value})
 			}
 		}
-
-		if len(columns) > 0 {
-			insertStmt := fmt.Sprintf(
-				"INSERT INTO %s (%s) VALUES (%s);",
-				tableName,
-				strings.Join(columns, ", "),
-				strings.Join(values, ", "),
-			)
-			b.WriteString(insertStmt)
-			b.WriteString("\n")
+		if len(row.Columns) > 0 {
+			op.Rows = append(op.Rows, row)
 		}
 	}
-
-	return b.String(), nil
+	return op, nil
 }
 
-// FetchDataAndGenerateInserts fetches data and generates INSERT statements.
-func (m *MigrationGenerator) FetchDataAndGenerateInserts(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, spec *openapi3.T, fetchedFKValues map[string][]interface{}, plan *OperationExtractionPlan) (string, error) {
-	resp := m.getSuccessResponse(op)
-	if resp == nil || resp.Value == nil {
-		return "", fmt.Errorf("no successful response found")
-	}
-
-	media := resp.Value.Content.Get("application/json")
-	if media == nil || media.Schema == nil {
-		return "", fmt.Errorf("no JSON response schema found")
-	}
-
-	data, fetchErr := m.fetcher.FetchData(ctx, baseURL, path, op, params)
-	if fetchErr != nil {
-		log.Printf("Warning: failed to fetch data for %s: %v", path, fetchErr)
-		return "", nil
-	}
-
-	m.extractFKValuesFromData(data, op, media, spec, fetchedFKValues)
-	m.extractFKValuesFromMarkedData(data, media.Schema, fetchedFKValues)
-
-	if plan != nil && plan.HasMarks {
-		insertStatements, err := m.generateInsertsFromMarkedPlan(data, plan)
-		if err != nil {
-			log.Printf("Warning: failed to generate marked INSERT statements: %v", err)
-			return "", nil
-		}
-		return insertStatements, nil
-	}
-
-	// legacy path
-	schemaName := m.getSchemaName(media.Schema)
-	expectedColumns := m.getExpectedColumns(resp, spec)
-
-	log.Printf("Successfully fetched data from %s", path)
-	log.Printf("Data length: %d bytes", len(data))
-
-	insertStatements, err := m.generateInsertStatements(data, schemaName, expectedColumns)
-	if err != nil {
-		log.Printf("Warning: failed to generate INSERT statements: %v", err)
-		return "", nil
-	}
-
-	return insertStatements, nil
-}
-
-func (m *MigrationGenerator) extractFKValuesFromData(data []byte, op *openapi3.Operation, media *openapi3.MediaType, spec *openapi3.T, fkValues map[string][]interface{}) {
+func (s *Service) extractFKValuesFromData(data []byte, op *openapi3.Operation, media *openapi3.MediaType, fkValues map[string][]interface{}) {
 	if media == nil || media.Schema == nil {
 		return
 	}
-
 	records, err := parseJSONRecords(data)
 	if err != nil {
 		return
 	}
-
-	fkFieldNames := m.findFKFields(op, media, spec)
+	fkFieldNames := s.findFKFields(op, media)
 	for _, record := range records {
 		for dependencyKey, responseField := range fkFieldNames {
 			if val, exists := record[responseField]; exists {
@@ -599,11 +590,10 @@ func (m *MigrationGenerator) extractFKValuesFromData(data []byte, op *openapi3.O
 	}
 }
 
-func (m *MigrationGenerator) extractFKValuesFromMarkedData(data []byte, schemaRef *openapi3.SchemaRef, fkValues map[string][]interface{}) {
+func (s *Service) extractFKValuesFromMarkedData(data []byte, schemaRef *openapi3.SchemaRef, fkValues map[string][]interface{}) {
 	if schemaRef == nil || schemaRef.Value == nil {
 		return
 	}
-
 	var payload interface{}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return
@@ -614,7 +604,6 @@ func (m *MigrationGenerator) extractFKValuesFromMarkedData(data []byte, schemaRe
 		if schema == nil || value == nil {
 			return
 		}
-
 		if schema.Type != nil && schema.Type.Is("array") {
 			arr, ok := value.([]interface{})
 			if !ok {
@@ -627,20 +616,12 @@ func (m *MigrationGenerator) extractFKValuesFromMarkedData(data []byte, schemaRe
 			}
 			return
 		}
-
 		if schema.Type != nil && schema.Type.Is("object") {
 			obj, ok := value.(map[string]interface{})
 			if !ok {
 				return
 			}
-
-			propNames := make([]string, 0, len(schema.Properties))
-			for name := range schema.Properties {
-				propNames = append(propNames, name)
-			}
-			sort.Strings(propNames)
-
-			for _, propName := range propNames {
+			for _, propName := range sortedPropertyNames(schema) {
 				propRef := schema.Properties[propName]
 				if propRef == nil || propRef.Value == nil {
 					continue
@@ -659,22 +640,19 @@ func (m *MigrationGenerator) extractFKValuesFromMarkedData(data []byte, schemaRe
 			}
 		}
 	}
-
 	walk(schemaRef.Value, payload)
 }
 
-func (m *MigrationGenerator) getSuccessResponse(op *openapi3.Operation) *openapi3.ResponseRef {
+func (s *Service) getSuccessResponse(op *openapi3.Operation) *openapi3.ResponseRef {
 	if op == nil || op.Responses == nil {
 		return nil
 	}
-
 	if resp := op.Responses.Value("200"); resp != nil {
 		return resp
 	}
 	if resp := op.Responses.Value("201"); resp != nil {
 		return resp
 	}
-
 	return nil
 }
 
@@ -683,35 +661,11 @@ func parseJSONRecords(data []byte) ([]map[string]interface{}, error) {
 	if err := json.Unmarshal(data, &arrayRecords); err == nil {
 		return arrayRecords, nil
 	}
-
 	var singleRecord map[string]interface{}
 	if err := json.Unmarshal(data, &singleRecord); err == nil {
 		return []map[string]interface{}{singleRecord}, nil
 	}
-
 	return nil, fmt.Errorf("expected JSON object or array of objects")
-}
-
-func toSQLLiteral(v interface{}) string {
-	switch value := v.(type) {
-	case nil:
-		return "NULL"
-	case string:
-		return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-	case bool:
-		if value {
-			return "TRUE"
-		}
-		return "FALSE"
-	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-		return fmt.Sprintf("%v", value)
-	default:
-		encoded, err := json.Marshal(value)
-		if err != nil {
-			return "NULL"
-		}
-		return "'" + strings.ReplaceAll(string(encoded), "'", "''") + "'"
-	}
 }
 
 func appendUniqueValue(values []interface{}, candidate interface{}) []interface{} {
@@ -725,11 +679,7 @@ func appendUniqueValue(values []interface{}, candidate interface{}) []interface{
 }
 
 func parseFKParamSpec(raw interface{}, paramName string) (FKParamSpec, error) {
-	spec := FKParamSpec{
-		ParamName:     paramName,
-		DependencyKey: paramName,
-	}
-
+	spec := FKParamSpec{ParamName: paramName, DependencyKey: paramName}
 	switch v := raw.(type) {
 	case bool:
 		if !v {
@@ -753,7 +703,6 @@ func parseFKParamSpecMap(spec FKParamSpec, m map[string]interface{}) (FKParamSpe
 		}
 		spec.DependencyKey = strings.TrimSpace(id)
 	}
-
 	if valuesRaw, ok := m["values"]; ok {
 		values, err := parseFilterValuesArray(valuesRaw, "x-fk.values")
 		if err != nil {
@@ -761,7 +710,6 @@ func parseFKParamSpecMap(spec FKParamSpec, m map[string]interface{}) (FKParamSpe
 		}
 		spec.SeedValues = uniqueValues(values)
 	}
-
 	if filterRaw, ok := m["filter"]; ok {
 		filter, err := parseFilterSpec(filterRaw)
 		if err != nil {
@@ -769,7 +717,6 @@ func parseFKParamSpecMap(spec FKParamSpec, m map[string]interface{}) (FKParamSpe
 		}
 		spec.Filter = filter
 	}
-
 	return spec, nil
 }
 
@@ -793,7 +740,6 @@ func parseFilterSpec(raw interface{}) (*FKFilterSpec, error) {
 	if !ok {
 		return nil, fmt.Errorf("x-fk.filter must be object")
 	}
-
 	opRaw, ok := filterMap["op"]
 	if !ok {
 		return nil, fmt.Errorf("x-fk.filter.op is required")
@@ -842,7 +788,6 @@ func parseFilterSpec(raw interface{}) (*FKFilterSpec, error) {
 	default:
 		return nil, fmt.Errorf("unsupported x-fk.filter.op: %s", op)
 	}
-
 	return spec, nil
 }
 
@@ -950,7 +895,6 @@ func equalsFilterValue(a, b interface{}) (bool, error) {
 		}
 		return true, nil
 	}
-
 	aNum, aIsNum := toNumber(a)
 	bNum, bIsNum := toNumber(b)
 	if aIsNum || bIsNum {
@@ -959,7 +903,6 @@ func equalsFilterValue(a, b interface{}) (bool, error) {
 		}
 		return aNum == bNum, nil
 	}
-
 	aTime, aIsTime := toRFC3339Time(a)
 	bTime, bIsTime := toRFC3339Time(b)
 	if aIsTime || bIsTime {
@@ -968,7 +911,6 @@ func equalsFilterValue(a, b interface{}) (bool, error) {
 		}
 		return aTime.Equal(bTime), nil
 	}
-
 	aBool, aIsBool := a.(bool)
 	bBool, bIsBool := b.(bool)
 	if aIsBool || bIsBool {
@@ -977,7 +919,6 @@ func equalsFilterValue(a, b interface{}) (bool, error) {
 		}
 		return aBool == bBool, nil
 	}
-
 	aStr, aIsStr := a.(string)
 	bStr, bIsStr := b.(string)
 	if aIsStr || bIsStr {
@@ -986,7 +927,6 @@ func equalsFilterValue(a, b interface{}) (bool, error) {
 		}
 		return aStr == bStr, nil
 	}
-
 	return false, fmt.Errorf("unsupported value type in 'in' filter: %T vs %T", a, b)
 }
 
@@ -1097,6 +1037,9 @@ func inferSQLType(t *openapi3.Types, format string) string {
 	if t.Is("string") {
 		return "TEXT"
 	}
+	if t.Is("array") || t.Is("object") {
+		return "JSONB"
+	}
 	return "TEXT"
 }
 
@@ -1175,37 +1118,37 @@ func sortedPropertyNames(schema *openapi3.Schema) []string {
 	return names
 }
 
-func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation) (*OperationExtractionPlan, error) {
-	resp := m.getSuccessResponse(op)
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) buildOperationExtractionPlan(op *openapi3.Operation) (*operationExtractionPlan, error) {
+	resp := s.getSuccessResponse(op)
 	if resp == nil || resp.Value == nil {
-		return &OperationExtractionPlan{HasMarks: false}, nil
+		return &operationExtractionPlan{HasMarks: false}, nil
 	}
 	media := resp.Value.Content.Get("application/json")
 	if media == nil || media.Schema == nil || media.Schema.Value == nil {
-		return &OperationExtractionPlan{HasMarks: false}, nil
+		return &operationExtractionPlan{HasMarks: false}, nil
 	}
 
-	plan := &OperationExtractionPlan{
+	plan := &operationExtractionPlan{
 		HasMarks:       false,
-		Nodes:          []*MarkedNodePlan{},
-		NodeByPath:     map[string]*MarkedNodePlan{},
-		ChildRelations: map[string][]*RelationPlan{},
-		Relations:      []*RelationPlan{},
+		Nodes:          []*markedNodePlan{},
+		NodeByPath:     map[string]*markedNodePlan{},
+		ChildRelations: map[string][]*relationPlan{},
+		Relations:      []*relationPlan{},
 	}
 	tableSignatures := make(map[string]string)
 	nodeCounter := 0
 
-	var registerNode func(
-		tableName string,
-		nodeSchema *openapi3.Schema,
-		nodeKind containerKind,
-		accessPath []string,
-		parentPath string,
-		parentProp string,
-		parentKind containerKind,
-	) (*MarkedNodePlan, error)
-
-	registerNode = func(tableName string, nodeSchema *openapi3.Schema, nodeKind containerKind, accessPath []string, parentPath string, parentProp string, parentKind containerKind) (*MarkedNodePlan, error) {
+	var registerNode func(string, *openapi3.Schema, containerKind, []string, string, string, containerKind) (*markedNodePlan, error)
+	registerNode = func(tableName string, nodeSchema *openapi3.Schema, nodeKind containerKind, accessPath []string, parentPath string, parentProp string, parentKind containerKind) (*markedNodePlan, error) {
 		if !isValidSQLIdentifier(tableName) {
 			return nil, fmt.Errorf("invalid x-table-name %q", tableName)
 		}
@@ -1225,7 +1168,7 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 
 		nodePath := fmt.Sprintf("node:%03d", nodeCounter)
 		nodeCounter++
-		node := &MarkedNodePlan{
+		node := &markedNodePlan{
 			Path:            nodePath,
 			TableName:       tableName,
 			PKField:         pkField,
@@ -1237,7 +1180,7 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 			ParentProp:      parentProp,
 			ParentNodeKind:  parentKind,
 			ScalarColumns:   []string{},
-			RelationColumns: map[string]RelationColumnPlan{},
+			RelationColumns: map[string]relationColumnPlan{},
 		}
 
 		for _, propName := range sortedPropertyNames(nodeSchema) {
@@ -1256,7 +1199,7 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 
 		if parentPath != "" {
 			parentNode := plan.NodeByPath[parentPath]
-			rel := &RelationPlan{
+			rel := &relationPlan{
 				ParentPath:     parentPath,
 				ChildPath:      nodePath,
 				ParentTable:    parentNode.TableName,
@@ -1277,12 +1220,11 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 			} else {
 				rel.Kind = relationDirectRef
 				rel.IsArrayRef = node.NodeKind == containerArray
+				rel.RefSQLType = node.PKSQLType
 				if rel.IsArrayRef {
-					rel.RefSQLType = node.PKSQLType + "[]"
-				} else {
-					rel.RefSQLType = node.PKSQLType
+					rel.RefSQLType += "[]"
 				}
-				parentNode.RelationColumns[parentProp] = RelationColumnPlan{
+				parentNode.RelationColumns[parentProp] = relationColumnPlan{
 					Name:     parentProp,
 					Type:     rel.RefSQLType,
 					IsArray:  rel.IsArrayRef,
@@ -1296,19 +1238,17 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 		return node, nil
 	}
 
-	var walk func(schema *openapi3.Schema, accessPath []string, ownerNodePath string, ownerNodeKind containerKind, ownerProp string) error
+	var walk func(*openapi3.Schema, []string, string, containerKind, string) error
 	walk = func(schema *openapi3.Schema, accessPath []string, ownerNodePath string, ownerNodeKind containerKind, ownerProp string) error {
 		if schema == nil {
 			return nil
 		}
-
 		if schema.Type != nil && schema.Type.Is("object") {
 			if tableName, ok := getTableNameExtension(schema); ok {
 				node, err := registerNode(tableName, schema, containerObject, accessPath, ownerNodePath, ownerProp, ownerNodeKind)
 				if err != nil {
 					return err
 				}
-
 				for _, propName := range sortedPropertyNames(schema) {
 					propRef := schema.Properties[propName]
 					if propRef == nil || propRef.Value == nil {
@@ -1320,7 +1260,6 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 				}
 				return nil
 			}
-
 			for _, propName := range sortedPropertyNames(schema) {
 				propRef := schema.Properties[propName]
 				if propRef == nil || propRef.Value == nil {
@@ -1336,7 +1275,6 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 			}
 			return nil
 		}
-
 		if schema.Type != nil && schema.Type.Is("array") {
 			if schema.Items == nil || schema.Items.Value == nil {
 				return nil
@@ -1360,17 +1298,14 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 					return nil
 				}
 			}
-
 			return walk(itemSchema, accessPath, ownerNodePath, ownerNodeKind, ownerProp)
 		}
-
 		return nil
 	}
 
 	if err := walk(media.Schema.Value, []string{}, "", "", ""); err != nil {
 		return nil, err
 	}
-
 	for _, rels := range plan.ChildRelations {
 		sort.Slice(rels, func(i, j int) bool {
 			if rels[i].ParentProp == rels[j].ParentProp {
@@ -1391,14 +1326,14 @@ func (m *MigrationGenerator) buildOperationExtractionPlan(op *openapi3.Operation
 	return plan, nil
 }
 
-func (m *MigrationGenerator) getRelationColumnsForNode(plan *OperationExtractionPlan, nodePath string) []ddl.RelationColumnSpec {
+func (s *Service) getRelationColumnsForNode(plan *operationExtractionPlan, nodePath string) []Column {
 	node := plan.NodeByPath[nodePath]
 	if node == nil || len(node.RelationColumns) == 0 {
 		return nil
 	}
-	cols := make([]ddl.RelationColumnSpec, 0, len(node.RelationColumns))
+	cols := make([]Column, 0, len(node.RelationColumns))
 	for _, c := range node.RelationColumns {
-		cols = append(cols, ddl.RelationColumnSpec{Name: c.Name, Type: c.Type})
+		cols = append(cols, Column{Name: c.Name, Type: c.Type, Nullable: true})
 	}
 	sort.Slice(cols, func(i, j int) bool { return cols[i].Name < cols[j].Name })
 	return cols
@@ -1421,10 +1356,10 @@ func resolveByPath(root interface{}, path []string) interface{} {
 }
 
 type markedInsertContext struct {
-	plan           *OperationExtractionPlan
-	insertedRows   map[string]map[string]bool
-	insertedLinks  map[string]bool
-	insertSQLLines []string
+	plan         *operationExtractionPlan
+	insertedRows map[string]map[string]bool
+	insertedLink map[string]bool
+	operations   []MigrationOperation
 }
 
 func (c *markedInsertContext) recordInsertedRow(tableName, pk string) bool {
@@ -1438,45 +1373,31 @@ func (c *markedInsertContext) recordInsertedRow(tableName, pk string) bool {
 	return true
 }
 
-func toSQLArrayLiteral(values []interface{}, elemType string) string {
-	cleanElemType := strings.TrimSuffix(elemType, "[]")
-	if len(values) == 0 {
-		return fmt.Sprintf("ARRAY[]::%s[]", cleanElemType)
-	}
-	parts := make([]string, 0, len(values))
-	for _, v := range values {
-		parts = append(parts, toSQLLiteral(v))
-	}
-	return fmt.Sprintf("ARRAY[%s]::%s[]", strings.Join(parts, ", "), cleanElemType)
-}
-
 func uniqueValues(values []interface{}) []interface{} {
 	seen := map[string]bool{}
 	result := make([]interface{}, 0, len(values))
-	for _, v := range values {
-		k := fmt.Sprintf("%v", v)
-		if seen[k] {
+	for _, value := range values {
+		key := fmt.Sprintf("%v", value)
+		if seen[key] {
 			continue
 		}
-		seen[k] = true
-		result = append(result, v)
+		seen[key] = true
+		result = append(result, value)
 	}
 	return result
 }
 
-func (m *MigrationGenerator) generateInsertsFromMarkedPlan(data []byte, plan *OperationExtractionPlan) (string, error) {
+func (s *Service) buildInsertOpsFromMarkedPlan(data []byte, plan *operationExtractionPlan) ([]MigrationOperation, error) {
 	var payload interface{}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", fmt.Errorf("unmarshal JSON: %w", err)
+		return nil, fmt.Errorf("unmarshal JSON: %w", err)
 	}
-
 	ctx := &markedInsertContext{
-		plan:           plan,
-		insertedRows:   map[string]map[string]bool{},
-		insertedLinks:  map[string]bool{},
-		insertSQLLines: []string{},
+		plan:         plan,
+		insertedRows: map[string]map[string]bool{},
+		insertedLink: map[string]bool{},
+		operations:   []MigrationOperation{},
 	}
-
 	for _, node := range plan.Nodes {
 		if node.ParentPath != "" {
 			continue
@@ -1487,23 +1408,18 @@ func (m *MigrationGenerator) generateInsertsFromMarkedPlan(data []byte, plan *Op
 		}
 		ctx.processNode(node, target)
 	}
-
-	if len(ctx.insertSQLLines) == 0 {
-		return "", nil
-	}
-	return strings.Join(ctx.insertSQLLines, "\n") + "\n", nil
+	return ctx.operations, nil
 }
 
-func (c *markedInsertContext) processNode(node *MarkedNodePlan, raw interface{}) []interface{} {
+func (c *markedInsertContext) processNode(node *markedNodePlan, raw interface{}) []interface{} {
 	if node == nil || raw == nil {
 		return nil
 	}
-
 	switch node.NodeKind {
 	case containerObject:
 		record, ok := raw.(map[string]interface{})
 		if !ok {
-			log.Printf("Warning: expected object for table %s", node.TableName)
+			log.Printf("warning: expected object for table %s", node.TableName)
 			return nil
 		}
 		pk := c.processRecord(node, record)
@@ -1517,7 +1433,7 @@ func (c *markedInsertContext) processNode(node *MarkedNodePlan, raw interface{})
 			if obj, single := raw.(map[string]interface{}); single {
 				arr = []interface{}{obj}
 			} else {
-				log.Printf("Warning: expected array for table %s", node.TableName)
+				log.Printf("warning: expected array for table %s", node.TableName)
 				return nil
 			}
 		}
@@ -1538,22 +1454,17 @@ func (c *markedInsertContext) processNode(node *MarkedNodePlan, raw interface{})
 	}
 }
 
-func (c *markedInsertContext) processRecord(node *MarkedNodePlan, record map[string]interface{}) interface{} {
-	if node == nil || record == nil {
-		return nil
-	}
-
-	rowValues := make(map[string]interface{})
+func (c *markedInsertContext) processRecord(node *markedNodePlan, record map[string]interface{}) interface{} {
+	rowValues := make(map[string]Value)
 	for _, col := range node.ScalarColumns {
-		if v, ok := record[col]; ok {
-			rowValues[col] = v
+		if value, ok := record[col]; ok {
+			rowValues[col] = Value{Scalar: value}
 		}
 	}
 
-	linkRows := make([]*RelationPlan, 0)
+	linkRows := make([]*relationPlan, 0)
 	linkChildValues := make(map[string][]interface{})
-	rels := c.plan.ChildRelations[node.Path]
-	for _, rel := range rels {
+	for _, rel := range c.plan.ChildRelations[node.Path] {
 		childNode := c.plan.NodeByPath[rel.ChildPath]
 		if childNode == nil {
 			continue
@@ -1568,9 +1479,9 @@ func (c *markedInsertContext) processRecord(node *MarkedNodePlan, record map[str
 		}
 		if rel.Kind == relationDirectRef {
 			if rel.IsArrayRef {
-				rowValues[rel.ParentProp] = childPKs
+				rowValues[rel.ParentProp] = Value{Array: childPKs, ArrayElementType: childNode.PKSQLType}
 			} else {
-				rowValues[rel.ParentProp] = childPKs[0]
+				rowValues[rel.ParentProp] = Value{Scalar: childPKs[0]}
 			}
 		} else if rel.Kind == relationLinkTable {
 			linkRows = append(linkRows, rel)
@@ -1580,43 +1491,35 @@ func (c *markedInsertContext) processRecord(node *MarkedNodePlan, record map[str
 
 	pk, ok := record[node.PKField]
 	if !ok {
-		log.Printf("Warning: missing x-pk field %s for table %s", node.PKField, node.TableName)
+		log.Printf("warning: missing x-pk field %s for table %s", node.PKField, node.TableName)
 		return nil
 	}
 	pkKey := fmt.Sprintf("%v", pk)
 
 	if c.recordInsertedRow(node.TableName, pkKey) {
 		orderedColumns := make([]string, 0, len(node.ScalarColumns)+len(node.RelationColumns))
-		for _, col := range node.ScalarColumns {
-			orderedColumns = append(orderedColumns, col)
-		}
+		orderedColumns = append(orderedColumns, node.ScalarColumns...)
 		relNames := make([]string, 0, len(node.RelationColumns))
-		for relCol := range node.RelationColumns {
-			relNames = append(relNames, relCol)
+		for name := range node.RelationColumns {
+			relNames = append(relNames, name)
 		}
 		sort.Strings(relNames)
 		orderedColumns = append(orderedColumns, relNames...)
 
-		cols := make([]string, 0, len(orderedColumns))
-		vals := make([]string, 0, len(orderedColumns))
+		row := InsertRow{}
 		for _, col := range orderedColumns {
-			v, exists := rowValues[col]
+			value, exists := rowValues[col]
 			if !exists {
 				continue
 			}
-			cols = append(cols, col)
-			relCol, isRel := node.RelationColumns[col]
-			if isRel && relCol.IsArray {
-				arr, _ := v.([]interface{})
-				vals = append(vals, toSQLArrayLiteral(arr, relCol.ElemType))
-				continue
-			}
-			vals = append(vals, toSQLLiteral(v))
+			row.Columns = append(row.Columns, col)
+			row.Values = append(row.Values, value)
 		}
-		if len(cols) > 0 {
-			c.insertSQLLines = append(c.insertSQLLines,
-				fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);", node.TableName, strings.Join(cols, ", "), strings.Join(vals, ", ")),
-			)
+		if len(row.Columns) > 0 {
+			c.operations = append(c.operations, InsertRowsOp{
+				TableName: node.TableName,
+				Rows:      []InsertRow{row},
+			})
 		}
 	}
 
@@ -1624,22 +1527,21 @@ func (c *markedInsertContext) processRecord(node *MarkedNodePlan, record map[str
 		childPKs := uniqueValues(linkChildValues[rel.ChildPath])
 		for _, childPK := range childPKs {
 			linkKey := fmt.Sprintf("%s|%v|%v", rel.JoinTableName, pk, childPK)
-			if c.insertedLinks[linkKey] {
+			if c.insertedLink[linkKey] {
 				continue
 			}
-			c.insertedLinks[linkKey] = true
-			c.insertSQLLines = append(c.insertSQLLines,
-				fmt.Sprintf(
-					"INSERT INTO %s (%s, %s) VALUES (%s, %s);",
-					rel.JoinTableName,
-					rel.JoinParentCol,
-					rel.JoinChildCol,
-					toSQLLiteral(pk),
-					toSQLLiteral(childPK),
-				),
-			)
+			c.insertedLink[linkKey] = true
+			c.operations = append(c.operations, InsertRowsOp{
+				TableName: rel.JoinTableName,
+				Rows: []InsertRow{{
+					Columns: []string{rel.JoinParentCol, rel.JoinChildCol},
+					Values: []Value{
+						{Scalar: pk},
+						{Scalar: childPK},
+					},
+				}},
+			})
 		}
 	}
-
 	return pk
 }

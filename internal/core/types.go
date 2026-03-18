@@ -3,12 +3,14 @@ package core
 import "context"
 
 type FetchRequest struct {
-	Method      string
-	BaseURL     string
-	Path        string
-	PathParams  map[string]string
-	QueryParams map[string]string
-	Headers     map[string]string
+	Method           string
+	BaseURL          string
+	Path             string
+	PathParams       map[string]string
+	QueryParams      map[string]string
+	Headers          map[string]string
+	SensitiveQuery   map[string]bool
+	SensitiveHeaders map[string]bool
 }
 
 type FetchResult struct {

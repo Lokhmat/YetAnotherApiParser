@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -56,10 +57,17 @@ type FKParamSpec struct {
 	Filter        *FKFilterSpec
 }
 
+type AuthParamSpec struct {
+	ParamName string
+	In        string
+	EnvVar    string
+}
+
 type operationInfo struct {
 	Path      string
 	Op        *openapi3.Operation
 	FKSpecs   []FKParamSpec
+	AuthSpecs []AuthParamSpec
 	IsFetched bool
 	Plan      *operationExtractionPlan
 }
@@ -127,6 +135,10 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 		if err != nil {
 			return nil, fmt.Errorf("parse x-fk for %s: %w", opInfo.path, err)
 		}
+		authSpecs, err := s.getAuthParamSpecs(opInfo.path, opInfo.op)
+		if err != nil {
+			return nil, fmt.Errorf("parse x-auth for %s: %w", opInfo.path, err)
+		}
 		extractionPlan, err := s.buildOperationExtractionPlan(opInfo.op)
 		if err != nil {
 			return nil, fmt.Errorf("build extraction plan for %s: %w", opInfo.path, err)
@@ -136,6 +148,7 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 			Path:      opInfo.path,
 			Op:        opInfo.op,
 			FKSpecs:   fkSpecs,
+			AuthSpecs: authSpecs,
 			Plan:      extractionPlan,
 			IsFetched: false,
 		}
@@ -219,7 +232,11 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 			if len(combinations) > 0 {
 				for _, combo := range combinations {
 					params := s.buildParamsMapFromSpecs(opInfo.FKSpecs, combo)
-					insertOps, err := s.fetchAndBuildInsertOps(ctx, baseURL, path, opInfo.Op, params, fetchedFKValues, opInfo.Plan)
+					params, missingAuth := s.applyAuthParams(path, params, opInfo.AuthSpecs)
+					if missingAuth {
+						continue
+					}
+					insertOps, err := s.fetchAndBuildInsertOps(ctx, baseURL, path, opInfo.Op, params, fetchedFKValues, opInfo.Plan, opInfo.AuthSpecs)
 					if err != nil {
 						log.Printf("failed to build INSERT ops for GET %s: %v", path, err)
 						continue
@@ -297,7 +314,7 @@ func buildCreateTableOpFromMarkedNode(node *markedNodePlan, relationColumns []Co
 	return op
 }
 
-func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, fetchedFKValues map[string][]interface{}, plan *operationExtractionPlan) ([]MigrationOperation, error) {
+func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, fetchedFKValues map[string][]interface{}, plan *operationExtractionPlan, authSpecs []AuthParamSpec) ([]MigrationOperation, error) {
 	resp := s.getSuccessResponse(op)
 	if resp == nil || resp.Value == nil {
 		return nil, fmt.Errorf("no successful response found")
@@ -308,7 +325,7 @@ func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path stri
 		return nil, fmt.Errorf("no JSON response schema found")
 	}
 
-	request, err := buildFetchRequest(baseURL, path, op, params)
+	request, err := buildFetchRequest(baseURL, path, op, params, authSpecs)
 	if err != nil {
 		return nil, err
 	}
@@ -343,14 +360,25 @@ func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path stri
 	return []MigrationOperation{insertOp}, nil
 }
 
-func buildFetchRequest(baseURL, path string, op *openapi3.Operation, params map[string]string) (FetchRequest, error) {
+func buildFetchRequest(baseURL, path string, op *openapi3.Operation, params map[string]string, authSpecs []AuthParamSpec) (FetchRequest, error) {
 	req := FetchRequest{
-		Method:      "GET",
-		BaseURL:     baseURL,
-		Path:        path,
-		PathParams:  map[string]string{},
-		QueryParams: map[string]string{},
-		Headers:     map[string]string{},
+		Method:           "GET",
+		BaseURL:          baseURL,
+		Path:             path,
+		PathParams:       map[string]string{},
+		QueryParams:      map[string]string{},
+		Headers:          map[string]string{},
+		SensitiveQuery:   map[string]bool{},
+		SensitiveHeaders: map[string]bool{},
+	}
+
+	for _, authSpec := range authSpecs {
+		switch authSpec.In {
+		case "query":
+			req.SensitiveQuery[authSpec.ParamName] = true
+		case "header":
+			req.SensitiveHeaders[authSpec.ParamName] = true
+		}
 	}
 
 	for _, paramRef := range op.Parameters {
@@ -435,12 +463,56 @@ func (s *Service) getFKParamSpecs(opPath string, op *openapi3.Operation) ([]FKPa
 	return specs, nil
 }
 
+func (s *Service) getAuthParamSpecs(opPath string, op *openapi3.Operation) ([]AuthParamSpec, error) {
+	var specs []AuthParamSpec
+	for _, paramRef := range op.Parameters {
+		if paramRef == nil || paramRef.Value == nil {
+			continue
+		}
+		raw, ok := paramRef.Value.Extensions["x-auth"]
+		if !ok {
+			continue
+		}
+		spec, err := parseAuthParamSpec(raw, paramRef.Value.Name, paramRef.Value.In)
+		if err != nil {
+			return nil, fmt.Errorf("%s parameter %s: %w", opPath, paramRef.Value.Name, err)
+		}
+		specs = append(specs, spec)
+	}
+	sort.Slice(specs, func(i, j int) bool {
+		if specs[i].In == specs[j].In {
+			return specs[i].ParamName < specs[j].ParamName
+		}
+		return specs[i].In < specs[j].In
+	})
+	return specs, nil
+}
+
 func (s *Service) buildParamsMapFromSpecs(specs []FKParamSpec, values []interface{}) map[string]string {
 	params := make(map[string]string)
 	for i, fk := range specs {
 		params[fk.ParamName] = fmt.Sprintf("%v", values[i])
 	}
 	return params
+}
+
+func (s *Service) applyAuthParams(opPath string, params map[string]string, authSpecs []AuthParamSpec) (map[string]string, bool) {
+	if len(authSpecs) == 0 {
+		return params, false
+	}
+	resolved := make(map[string]string, len(params)+len(authSpecs))
+	for k, v := range params {
+		resolved[k] = v
+	}
+	for _, authSpec := range authSpecs {
+		value, ok := os.LookupEnv(authSpec.EnvVar)
+		if !ok {
+			log.Printf("warning: skipping %s because auth env %s for parameter %s is not set", opPath, authSpec.EnvVar, authSpec.ParamName)
+			return nil, true
+		}
+		resolved[authSpec.ParamName] = value
+	}
+	return resolved, false
 }
 
 func (s *Service) buildEffectiveFKValueLists(opPath string, specs []FKParamSpec, fetchedFKValues map[string][]interface{}) ([][]interface{}, bool, error) {
@@ -693,6 +765,21 @@ func parseFKParamSpec(raw interface{}, paramName string) (FKParamSpec, error) {
 	default:
 		return spec, fmt.Errorf("unsupported x-fk type: %T", raw)
 	}
+}
+
+func parseAuthParamSpec(raw interface{}, paramName, in string) (AuthParamSpec, error) {
+	envVar, ok := raw.(string)
+	if !ok || strings.TrimSpace(envVar) == "" {
+		return AuthParamSpec{}, fmt.Errorf("x-auth must be a non-empty string")
+	}
+	if in != "header" && in != "query" {
+		return AuthParamSpec{}, fmt.Errorf("x-auth is supported only for header and query parameters")
+	}
+	return AuthParamSpec{
+		ParamName: paramName,
+		In:        in,
+		EnvVar:    strings.TrimSpace(envVar),
+	}, nil
 }
 
 func parseFKParamSpecMap(spec FKParamSpec, m map[string]interface{}) (FKParamSpec, error) {

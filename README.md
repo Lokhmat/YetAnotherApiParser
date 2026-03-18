@@ -15,6 +15,7 @@ With the default Postgres adapter it still generates PostgreSQL SQL such as:
 It can:
 
 - resolve endpoint dependencies with `x-fk`
+- inject env-backed auth parameters with `x-auth`
 - fetch in dependency order
 - flatten marked nested response objects into separate tables (`x-table-name`)
 - export SQL through the DB adapter
@@ -126,6 +127,31 @@ Rules:
    - strict RFC3339 datetime strings
 5. If any FK param has an empty candidate set after filtering, operation is skipped (no requests).
 
+### `x-auth` (operation parameter)
+
+Maps a parameter value to an environment variable.
+
+Supported form:
+
+```yaml
+parameters:
+  - name: X-API-Key
+    in: header
+    required: true
+    x-auth: API_TOKEN
+    schema:
+      type: string
+```
+
+Rules:
+
+1. `x-auth` must be a non-empty string.
+2. Supported parameter locations are `header` and `query`.
+3. The value is read from the named environment variable for every request.
+4. If a parameter has both `x-auth` and `x-fk`, `x-auth` wins.
+5. If the env var is missing, that operation is skipped and a warning is logged.
+6. Auth-backed parameter values are always redacted in request logs.
+
 ### `x-pk` (response property)
 
 Marks a property as primary key.
@@ -155,10 +181,11 @@ If at least one `x-table-name` exists in an operation response schema, parser sw
 For fetchable operations (`x-res-type`):
 
 1. Build operation FK specs from parameter `x-fk`.
-2. For each op, build FK candidate lists.
-3. Build cartesian product of FK lists.
-4. Request operation for each combination.
-5. Extract FK values from responses and feed downstream operations.
+2. Resolve auth-backed parameter specs from `x-auth`.
+3. For each op, build FK candidate lists.
+4. Build cartesian product of FK lists.
+5. Request operation for each combination, injecting auth values from env when configured.
+6. Extract FK values from responses and feed downstream operations.
 
 Operations without any `x-fk` are called once with empty parameter combination.
 
@@ -185,6 +212,8 @@ Each HTTP request appends one line to `runtime.run_log_path`:
 - params
 - status code
 - transport error (if request failed before response)
+
+Parameters resolved through `x-auth` are logged as `***`.
 
 Example line:
 

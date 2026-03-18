@@ -27,14 +27,30 @@ func TestExportSQL(t *testing.T) {
 			},
 			core.InsertRowsOp{
 				TableName: "users",
-				Rows: []core.InsertRow{{
-					Columns: []string{"id", "name", "phones"},
-					Values: []core.Value{
-						{Scalar: 1},
-						{Scalar: "alice"},
-						{Array: []interface{}{10, 11}, ArrayElementType: "INTEGER"},
+				Rows: []core.InsertRow{
+					{
+						Columns: []string{"id", "name", "phones"},
+						Values: []core.Value{
+							{Scalar: 1},
+							{Scalar: "alice"},
+							{Array: []interface{}{10, 11}, ArrayElementType: "INTEGER"},
+						},
 					},
-				}},
+					{
+						Columns: []string{"id", "name"},
+						Values: []core.Value{
+							{Scalar: 2},
+							{Scalar: "line1\nline2"},
+						},
+					},
+					{
+						Columns: []string{"id", "name"},
+						Values: []core.Value{
+							{Scalar: 1},
+							{Scalar: "duplicate"},
+						},
+					},
+				},
 			},
 		},
 	}
@@ -51,10 +67,14 @@ func TestExportSQL(t *testing.T) {
 		"phones INTEGER[]",
 		"CREATE TABLE orders_tags_link",
 		"PRIMARY KEY (orders_oid, tags_tid)",
-		"INSERT INTO users (id, name, phones) VALUES (1, 'alice', ARRAY[10, 11]::INTEGER[]);",
+		"INSERT INTO users (id, name, phones) VALUES (1, E'alice', ARRAY[10, 11]::INTEGER[]) ON CONFLICT (id) DO NOTHING;",
+		"INSERT INTO users (id, name) VALUES (2, E'line1\\nline2') ON CONFLICT (id) DO NOTHING;",
 	} {
 		if !strings.Contains(sqlText, needle) {
 			t.Fatalf("expected SQL to contain %q\nactual:\n%s", needle, sqlText)
 		}
+	}
+	if strings.Contains(sqlText, "duplicate") {
+		t.Fatalf("expected duplicate PK row to be omitted from exported SQL\nactual:\n%s", sqlText)
 	}
 }

@@ -1,7 +1,7 @@
-openapi_path: example/binance.json
+openapi_path: example/github.json
 
 api:
-  base_url: https://api.binance.com
+  base_url: https://api.github.com/
   max_rpm: 60
   request_timeout: 30
   retries:

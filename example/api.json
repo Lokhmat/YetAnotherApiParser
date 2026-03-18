@@ -86,8 +86,9 @@
         "parameters": [
           {
             "name": "publicationId",
-            "x-fk": {
-              "id": "publicationId"
+            "x-param-data": {
+              "type": "operation",
+              "operation-id": "publicationId"
             },
             "in": "query",
             "required": true,
@@ -743,7 +744,9 @@
           "properties": {
             "id": {
               "description": "Идентификатор записи",
-              "x-fk": "publicationId",
+              "x-response-data": {
+                "id": "publicationId"
+              },
               "x-pk": true,
               "type": "integer",
               "format": "int32",

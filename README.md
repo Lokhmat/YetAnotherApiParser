@@ -5,9 +5,9 @@
 Current built-in providers:
 
 - API provider: `openapi_http`
-- DB provider: `postgres`
+- DB providers: `postgres`, `clickhouse`
 
-With the default Postgres adapter it still generates PostgreSQL SQL such as:
+With the built-in adapters it generates provider-specific SQL such as:
 
 - `CREATE TABLE ...`
 - `INSERT INTO ...`
@@ -24,8 +24,8 @@ It can:
 
 ## Requirements
 
-- Go 1.22+
-- PostgreSQL (optional; if DB is unavailable, SQL is still written to file)
+- Go 1.24+
+- PostgreSQL or ClickHouse (optional; if DB is unavailable, SQL is still written to file)
 
 ## Configuration
 
@@ -52,6 +52,16 @@ database:
   connection_string: "host=localhost port=5440 user=postgres password=postgres dbname=api_parser"
 ```
 
+ClickHouse example:
+
+```yaml
+database:
+  provider: "clickhouse"
+  connection_string: "<clickhouse-go database/sql DSN>"
+```
+
+Use the official `clickhouse-go` `database/sql` DSN format for `database.connection_string`.
+
 Compatibility notes:
 
 - `api.provider` defaults to `openapi_http`
@@ -59,6 +69,13 @@ Compatibility notes:
 - `runtime.sql_output_path` defaults to `res.sql`
 - `runtime.run_log_path` defaults to `runlog.log`
 - old config files without `provider` or `runtime` sections still work
+
+ClickHouse adapter notes:
+
+- tables are created with `MergeTree()`
+- primary keys from `x-pk` become the table `ORDER BY` key
+- nullable scalar columns become `Nullable(...)`
+- `TEXT` and `JSONB` values are stored as `String`
 
 ## Run
 
@@ -85,6 +102,10 @@ The project is now split into four main modules:
 - `internal/db`: DB target registry and provider-specific execution/SQL export
 
 Connectors are compiled into the binary and selected by config.
+
+## Testing
+
+See [`tests.md`](tests.md) for the package-by-package testing strategy and the canonical test command.
 
 ## Extension Reference
 

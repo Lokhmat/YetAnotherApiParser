@@ -40635,6 +40635,13 @@
       "offset": {
         "name": "offset",
         "in": "query",
+        "x-param-data": {
+          "type": "offset",
+          "offset": {
+            "start": 0,
+            "increment": 100
+          }
+        },
         "schema": {
           "type": "integer",
           "format": "int32"
@@ -41071,9 +41078,10 @@
       "arraySymbols": {
         "name": "symbols",
         "in": "query",
-        "x-fk": {
+        "x-param-data": {
+          "type": "values",
           "values": [
-           "[\"BTCUSDT\",\"BNBBTC\"]"
+            "[\"BTCUSDT\",\"BNBBTC\"]"
           ]
         },
         "schema": {

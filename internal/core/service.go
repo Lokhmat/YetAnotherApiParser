@@ -44,17 +44,34 @@ const (
 	filterOpLTE = "lte"
 )
 
-type FKFilterSpec struct {
+type paramDataType string
+
+const (
+	paramDataTypeOperation paramDataType = "operation"
+	paramDataTypeValues    paramDataType = "values"
+	paramDataTypeCursor    paramDataType = "cursor"
+	paramDataTypeOffset    paramDataType = "offset"
+)
+
+type ParamFilterSpec struct {
 	Op     string
 	Value  interface{}
 	Values []interface{}
 }
 
-type FKParamSpec struct {
-	ParamName     string
-	DependencyKey string
-	SeedValues    []interface{}
-	Filter        *FKFilterSpec
+type OffsetParamSpec struct {
+	Start     interface{}
+	Increment interface{}
+}
+
+type ParamDataSpec struct {
+	ParamName    string
+	Type         paramDataType
+	OperationID  string
+	Values       []interface{}
+	Filter       *ParamFilterSpec
+	CursorPath   string
+	OffsetConfig *OffsetParamSpec
 }
 
 type AuthParamSpec struct {
@@ -64,12 +81,13 @@ type AuthParamSpec struct {
 }
 
 type operationInfo struct {
-	Path      string
-	Op        *openapi3.Operation
-	FKSpecs   []FKParamSpec
-	AuthSpecs []AuthParamSpec
-	IsFetched bool
-	Plan      *operationExtractionPlan
+	Path           string
+	Op             *openapi3.Operation
+	ParamSpecs     []ParamDataSpec
+	PaginationSpec *ParamDataSpec
+	AuthSpecs      []AuthParamSpec
+	IsFetched      bool
+	Plan           *operationExtractionPlan
 }
 
 type relationColumnPlan struct {
@@ -131,9 +149,12 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 
 	operations := s.collectOperationsWithResType(spec)
 	for _, opInfo := range operations {
-		fkSpecs, err := s.getFKParamSpecs(opInfo.path, opInfo.op)
+		paramSpecs, paginationSpec, err := s.getParamDataSpecs(opInfo.path, opInfo.op)
 		if err != nil {
-			return nil, fmt.Errorf("parse x-fk for %s: %w", opInfo.path, err)
+			return nil, fmt.Errorf("parse x-param-data for %s: %w", opInfo.path, err)
+		}
+		if err := validateResponseDataHints(opInfo.path, opInfo.op); err != nil {
+			return nil, err
 		}
 		authSpecs, err := s.getAuthParamSpecs(opInfo.path, opInfo.op)
 		if err != nil {
@@ -145,12 +166,13 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 		}
 
 		operationDependencies[opInfo.path] = &operationInfo{
-			Path:      opInfo.path,
-			Op:        opInfo.op,
-			FKSpecs:   fkSpecs,
-			AuthSpecs: authSpecs,
-			Plan:      extractionPlan,
-			IsFetched: false,
+			Path:           opInfo.path,
+			Op:             opInfo.op,
+			ParamSpecs:     paramSpecs,
+			PaginationSpec: paginationSpec,
+			AuthSpecs:      authSpecs,
+			Plan:           extractionPlan,
+			IsFetched:      false,
 		}
 
 		if extractionPlan != nil && extractionPlan.HasMarks {
@@ -198,7 +220,7 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 		generatedTables[schemaName] = true
 	}
 
-	fetchedFKValues := make(map[string][]interface{})
+	fetchedResponseValues := make(map[string][]interface{})
 
 	for {
 		shouldContinue := false
@@ -216,27 +238,27 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 			}
 
 			var combinations [][]interface{}
-			if len(opInfo.FKSpecs) == 0 {
+			if len(opInfo.ParamSpecs) == 0 {
 				combinations = [][]interface{}{{}}
 			} else {
-				fkValueLists, ready, err := s.buildEffectiveFKValueLists(path, opInfo.FKSpecs, fetchedFKValues)
+				valueLists, ready, err := s.buildEffectiveParamValueLists(path, opInfo.ParamSpecs, fetchedResponseValues)
 				if err != nil {
 					return nil, err
 				}
 				if !ready {
 					continue
 				}
-				combinations = s.generateCombinations(fkValueLists)
+				combinations = s.generateCombinations(valueLists)
 			}
 
 			if len(combinations) > 0 {
 				for _, combo := range combinations {
-					params := s.buildParamsMapFromSpecs(opInfo.FKSpecs, combo)
+					params := s.buildParamsMapFromSpecs(opInfo.ParamSpecs, combo)
 					params, missingAuth := s.applyAuthParams(path, params, opInfo.AuthSpecs)
 					if missingAuth {
 						continue
 					}
-					insertOps, err := s.fetchAndBuildInsertOps(ctx, baseURL, path, opInfo.Op, params, fetchedFKValues, opInfo.Plan, opInfo.AuthSpecs)
+					insertOps, err := s.fetchAndBuildInsertOps(ctx, baseURL, path, opInfo.Op, params, opInfo.PaginationSpec, fetchedResponseValues, opInfo.Plan, opInfo.AuthSpecs)
 					if err != nil {
 						log.Printf("failed to build INSERT ops for GET %s: %v", path, err)
 						continue
@@ -314,7 +336,7 @@ func buildCreateTableOpFromMarkedNode(node *markedNodePlan, relationColumns []Co
 	return op
 }
 
-func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, fetchedFKValues map[string][]interface{}, plan *operationExtractionPlan, authSpecs []AuthParamSpec) ([]MigrationOperation, error) {
+func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, paginationSpec *ParamDataSpec, fetchedResponseValues map[string][]interface{}, plan *operationExtractionPlan, authSpecs []AuthParamSpec) ([]MigrationOperation, error) {
 	resp := s.getSuccessResponse(op)
 	if resp == nil || resp.Value == nil {
 		return nil, fmt.Errorf("no successful response found")
@@ -325,39 +347,62 @@ func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path stri
 		return nil, fmt.Errorf("no JSON response schema found")
 	}
 
-	request, err := buildFetchRequest(baseURL, path, op, params, authSpecs)
-	if err != nil {
-		return nil, err
-	}
-	result, err := s.api.Fetch(ctx, request)
-	if err != nil {
-		log.Printf("warning: failed to fetch data for %s: %v", path, err)
-		return nil, nil
-	}
+	allInsertOps := make([]MigrationOperation, 0)
+	paginationValue, hasPaginationValue := initialPaginationValue(paginationSpec)
 
-	s.extractFKValuesFromData(result.Payload, op, media, fetchedFKValues)
-	s.extractFKValuesFromMarkedData(result.Payload, media.Schema, fetchedFKValues)
+	for {
+		requestParams := cloneStringMap(params)
+		if paginationSpec != nil && hasPaginationValue {
+			requestParams[paginationSpec.ParamName] = fmt.Sprintf("%v", paginationValue)
+		}
 
-	if plan != nil && plan.HasMarks {
-		insertOps, err := s.buildInsertOpsFromMarkedPlan(result.Payload, plan)
+		request, err := buildFetchRequest(baseURL, path, op, requestParams, authSpecs)
 		if err != nil {
-			log.Printf("warning: failed to build marked INSERT operations: %v", err)
+			return nil, err
+		}
+		result, err := s.api.Fetch(ctx, request)
+		if err != nil {
+			log.Printf("warning: failed to fetch data for %s: %v", path, err)
 			return nil, nil
 		}
-		return insertOps, nil
+
+		s.extractResponseDataFromData(result.Payload, media, fetchedResponseValues)
+		s.extractResponseDataFromMarkedData(result.Payload, media.Schema, fetchedResponseValues)
+
+		pageInsertOps, hasRows, err := s.buildInsertOpsForPayload(result.Payload, resp, media, plan)
+		if err != nil {
+			return nil, err
+		}
+		allInsertOps = append(allInsertOps, pageInsertOps...)
+
+		if paginationSpec == nil {
+			break
+		}
+
+		switch paginationSpec.Type {
+		case paramDataTypeCursor:
+			nextValue, ok := extractCursorValue(result.Payload, paginationSpec.CursorPath)
+			if !ok {
+				return allInsertOps, nil
+			}
+			paginationValue = nextValue
+			hasPaginationValue = true
+		case paramDataTypeOffset:
+			if !hasRows {
+				return allInsertOps, nil
+			}
+			nextValue, err := incrementOffsetValue(paginationValue, paginationSpec.OffsetConfig.Increment)
+			if err != nil {
+				return nil, fmt.Errorf("%s parameter %s: %w", path, paginationSpec.ParamName, err)
+			}
+			paginationValue = nextValue
+			hasPaginationValue = true
+		default:
+			return nil, fmt.Errorf("unsupported pagination type %q", paginationSpec.Type)
+		}
 	}
 
-	schemaName := s.getSchemaName(media.Schema)
-	expectedColumns := s.getExpectedColumns(resp)
-	insertOp, err := s.buildInsertRowsOp(result.Payload, schemaName, expectedColumns)
-	if err != nil {
-		log.Printf("warning: failed to build INSERT operations: %v", err)
-		return nil, nil
-	}
-	if len(insertOp.Rows) == 0 {
-		return nil, nil
-	}
-	return []MigrationOperation{insertOp}, nil
+	return allInsertOps, nil
 }
 
 func buildFetchRequest(baseURL, path string, op *openapi3.Operation, params map[string]string, authSpecs []AuthParamSpec) (FetchRequest, error) {
@@ -440,27 +485,39 @@ func (s *Service) collectOperationsWithResType(spec *openapi3.T) []struct {
 	return operations
 }
 
-func (s *Service) getFKParamSpecs(opPath string, op *openapi3.Operation) ([]FKParamSpec, error) {
-	var specs []FKParamSpec
+func (s *Service) getParamDataSpecs(opPath string, op *openapi3.Operation) ([]ParamDataSpec, *ParamDataSpec, error) {
+	var specs []ParamDataSpec
+	var paginationSpec *ParamDataSpec
 	for _, paramRef := range op.Parameters {
 		if paramRef == nil || paramRef.Value == nil {
 			continue
 		}
-		raw, ok := paramRef.Value.Extensions["x-fk"]
+		if _, legacy := paramRef.Value.Extensions["x-fk"]; legacy {
+			return nil, nil, fmt.Errorf("%s parameter %s: x-fk is no longer supported; use x-param-data", opPath, paramRef.Value.Name)
+		}
+		raw, ok := paramRef.Value.Extensions["x-param-data"]
 		if !ok {
 			continue
 		}
-		spec, err := parseFKParamSpec(raw, paramRef.Value.Name)
+		spec, err := parseParamDataSpec(raw, paramRef.Value.Name)
 		if err != nil {
-			return nil, fmt.Errorf("%s parameter %s: %w", opPath, paramRef.Value.Name, err)
+			return nil, nil, fmt.Errorf("%s parameter %s: %w", opPath, paramRef.Value.Name, err)
 		}
-		if err := validateFKSpec(spec); err != nil {
-			return nil, fmt.Errorf("%s parameter %s: %w", opPath, paramRef.Value.Name, err)
+		if err := validateParamDataSpec(spec); err != nil {
+			return nil, nil, fmt.Errorf("%s parameter %s: %w", opPath, paramRef.Value.Name, err)
+		}
+		if spec.Type == paramDataTypeCursor || spec.Type == paramDataTypeOffset {
+			if paginationSpec != nil {
+				return nil, nil, fmt.Errorf("%s defines multiple pagination parameters", opPath)
+			}
+			specCopy := spec
+			paginationSpec = &specCopy
+			continue
 		}
 		specs = append(specs, spec)
 	}
 	sort.Slice(specs, func(i, j int) bool { return specs[i].ParamName < specs[j].ParamName })
-	return specs, nil
+	return specs, paginationSpec, nil
 }
 
 func (s *Service) getAuthParamSpecs(opPath string, op *openapi3.Operation) ([]AuthParamSpec, error) {
@@ -488,10 +545,10 @@ func (s *Service) getAuthParamSpecs(opPath string, op *openapi3.Operation) ([]Au
 	return specs, nil
 }
 
-func (s *Service) buildParamsMapFromSpecs(specs []FKParamSpec, values []interface{}) map[string]string {
+func (s *Service) buildParamsMapFromSpecs(specs []ParamDataSpec, values []interface{}) map[string]string {
 	params := make(map[string]string)
-	for i, fk := range specs {
-		params[fk.ParamName] = fmt.Sprintf("%v", values[i])
+	for i, spec := range specs {
+		params[spec.ParamName] = fmt.Sprintf("%v", values[i])
 	}
 	return params
 }
@@ -515,26 +572,19 @@ func (s *Service) applyAuthParams(opPath string, params map[string]string, authS
 	return resolved, false
 }
 
-func (s *Service) buildEffectiveFKValueLists(opPath string, specs []FKParamSpec, fetchedFKValues map[string][]interface{}) ([][]interface{}, bool, error) {
-	fkValueLists := make([][]interface{}, 0, len(specs))
-	for _, fk := range specs {
-		values := make([]interface{}, 0, len(fk.SeedValues))
-		values = append(values, fk.SeedValues...)
-		if fetchedValues, ok := fetchedFKValues[fk.DependencyKey]; ok {
-			values = append(values, fetchedValues...)
-		}
-		values = uniqueValues(values)
-
-		filtered, err := applyFKFilter(values, fk.Filter)
+func (s *Service) buildEffectiveParamValueLists(opPath string, specs []ParamDataSpec, fetchedResponseValues map[string][]interface{}) ([][]interface{}, bool, error) {
+	valueLists := make([][]interface{}, 0, len(specs))
+	for _, spec := range specs {
+		values, ready, err := s.buildEffectiveParamValues(opPath, spec, fetchedResponseValues)
 		if err != nil {
-			return nil, false, fmt.Errorf("%s parameter %s: %w", opPath, fk.ParamName, err)
+			return nil, false, err
 		}
-		if len(filtered) == 0 {
+		if !ready || len(values) == 0 {
 			return nil, false, nil
 		}
-		fkValueLists = append(fkValueLists, filtered)
+		valueLists = append(valueLists, values)
 	}
-	return fkValueLists, true, nil
+	return valueLists, true, nil
 }
 
 func (s *Service) generateCombinations(valueLists [][]interface{}) [][]interface{} {
@@ -560,24 +610,11 @@ func (s *Service) generateCombinations(valueLists [][]interface{}) [][]interface
 	return result
 }
 
-func (s *Service) findFKFields(op *openapi3.Operation, media *openapi3.MediaType) map[string]string {
-	fkFieldNames := make(map[string]string)
-	for _, paramRef := range op.Parameters {
-		if paramRef == nil || paramRef.Value == nil {
-			continue
-		}
-		if raw, ok := paramRef.Value.Extensions["x-fk"]; ok {
-			fkSpec, err := parseFKParamSpec(raw, paramRef.Value.Name)
-			if err != nil {
-				continue
-			}
-			fkFieldNames[fkSpec.DependencyKey] = fkSpec.DependencyKey
-		}
-	}
-
+func (s *Service) findResponseDataFields(media *openapi3.MediaType) map[string]string {
+	fieldNames := make(map[string]string)
 	schema := media.Schema.Value
 	if schema == nil {
-		return fkFieldNames
+		return fieldNames
 	}
 	if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil {
 		schema = schema.Items.Value
@@ -587,15 +624,103 @@ func (s *Service) findFKFields(op *openapi3.Operation, media *openapi3.MediaType
 			if propRef == nil || propRef.Value == nil {
 				continue
 			}
-			if fkVal, ok := propRef.Value.Extensions["x-fk"]; ok {
-				dependencyKey := fmt.Sprintf("%v", fkVal)
-				if dependencyKey != "" {
-					fkFieldNames[dependencyKey] = propName
-				}
+			if spec, ok, err := parseResponseDataSpec(propRef.Value.Extensions); err == nil && ok {
+				fieldNames[spec] = propName
 			}
 		}
 	}
-	return fkFieldNames
+	return fieldNames
+}
+
+func (s *Service) buildInsertOpsForPayload(data []byte, resp *openapi3.ResponseRef, media *openapi3.MediaType, plan *operationExtractionPlan) ([]MigrationOperation, bool, error) {
+	if plan != nil && plan.HasMarks {
+		insertOps, err := s.buildInsertOpsFromMarkedPlan(data, plan)
+		if err != nil {
+			log.Printf("warning: failed to build marked INSERT operations: %v", err)
+			return nil, false, nil
+		}
+		return insertOps, len(insertOps) > 0, nil
+	}
+
+	schemaName := s.getSchemaName(media.Schema)
+	expectedColumns := s.getExpectedColumns(resp)
+	insertOp, err := s.buildInsertRowsOp(data, schemaName, expectedColumns)
+	if err != nil {
+		log.Printf("warning: failed to build INSERT operations: %v", err)
+		return nil, false, nil
+	}
+	if len(insertOp.Rows) == 0 {
+		return nil, false, nil
+	}
+	return []MigrationOperation{insertOp}, true, nil
+}
+
+func (s *Service) extractResponseDataFromData(data []byte, media *openapi3.MediaType, responseValues map[string][]interface{}) {
+	if media == nil || media.Schema == nil {
+		return
+	}
+	records, err := parseJSONRecords(data)
+	if err != nil {
+		return
+	}
+	fieldNames := s.findResponseDataFields(media)
+	for _, record := range records {
+		for responseID, responseField := range fieldNames {
+			if val, exists := record[responseField]; exists {
+				responseValues[responseID] = appendUniqueValue(responseValues[responseID], val)
+			}
+		}
+	}
+}
+
+func (s *Service) extractResponseDataFromMarkedData(data []byte, schemaRef *openapi3.SchemaRef, responseValues map[string][]interface{}) {
+	if schemaRef == nil || schemaRef.Value == nil {
+		return
+	}
+	var payload interface{}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return
+	}
+
+	var walk func(schema *openapi3.Schema, value interface{})
+	walk = func(schema *openapi3.Schema, value interface{}) {
+		if schema == nil || value == nil {
+			return
+		}
+		if schema.Type != nil && schema.Type.Is("array") {
+			arr, ok := value.([]interface{})
+			if !ok {
+				return
+			}
+			for _, item := range arr {
+				if schema.Items != nil {
+					walk(schema.Items.Value, item)
+				}
+			}
+			return
+		}
+		if schema.Type != nil && schema.Type.Is("object") {
+			obj, ok := value.(map[string]interface{})
+			if !ok {
+				return
+			}
+			for _, propName := range sortedPropertyNames(schema) {
+				propRef := schema.Properties[propName]
+				if propRef == nil || propRef.Value == nil {
+					continue
+				}
+				propVal, exists := obj[propName]
+				if !exists {
+					continue
+				}
+				if responseID, ok, err := parseResponseDataSpec(propRef.Value.Extensions); err == nil && ok {
+					responseValues[responseID] = appendUniqueValue(responseValues[responseID], propVal)
+				}
+				walk(propRef.Value, propVal)
+			}
+		}
+	}
+	walk(schemaRef.Value, payload)
 }
 
 func (s *Service) getExpectedColumns(resp *openapi3.ResponseRef) []string {
@@ -644,77 +769,6 @@ func (s *Service) buildInsertRowsOp(data []byte, tableName string, expectedColum
 	return op, nil
 }
 
-func (s *Service) extractFKValuesFromData(data []byte, op *openapi3.Operation, media *openapi3.MediaType, fkValues map[string][]interface{}) {
-	if media == nil || media.Schema == nil {
-		return
-	}
-	records, err := parseJSONRecords(data)
-	if err != nil {
-		return
-	}
-	fkFieldNames := s.findFKFields(op, media)
-	for _, record := range records {
-		for dependencyKey, responseField := range fkFieldNames {
-			if val, exists := record[responseField]; exists {
-				fkValues[dependencyKey] = appendUniqueValue(fkValues[dependencyKey], val)
-			}
-		}
-	}
-}
-
-func (s *Service) extractFKValuesFromMarkedData(data []byte, schemaRef *openapi3.SchemaRef, fkValues map[string][]interface{}) {
-	if schemaRef == nil || schemaRef.Value == nil {
-		return
-	}
-	var payload interface{}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return
-	}
-
-	var walk func(schema *openapi3.Schema, value interface{})
-	walk = func(schema *openapi3.Schema, value interface{}) {
-		if schema == nil || value == nil {
-			return
-		}
-		if schema.Type != nil && schema.Type.Is("array") {
-			arr, ok := value.([]interface{})
-			if !ok {
-				return
-			}
-			for _, item := range arr {
-				if schema.Items != nil {
-					walk(schema.Items.Value, item)
-				}
-			}
-			return
-		}
-		if schema.Type != nil && schema.Type.Is("object") {
-			obj, ok := value.(map[string]interface{})
-			if !ok {
-				return
-			}
-			for _, propName := range sortedPropertyNames(schema) {
-				propRef := schema.Properties[propName]
-				if propRef == nil || propRef.Value == nil {
-					continue
-				}
-				propVal, exists := obj[propName]
-				if !exists {
-					continue
-				}
-				if fkVal, ok := propRef.Value.Extensions["x-fk"]; ok {
-					depKey := fmt.Sprintf("%v", fkVal)
-					if depKey != "" {
-						fkValues[depKey] = appendUniqueValue(fkValues[depKey], propVal)
-					}
-				}
-				walk(propRef.Value, propVal)
-			}
-		}
-	}
-	walk(schemaRef.Value, payload)
-}
-
 func (s *Service) getSuccessResponse(op *openapi3.Operation) *openapi3.ResponseRef {
 	if op == nil || op.Responses == nil {
 		return nil
@@ -750,20 +804,33 @@ func appendUniqueValue(values []interface{}, candidate interface{}) []interface{
 	return append(values, candidate)
 }
 
-func parseFKParamSpec(raw interface{}, paramName string) (FKParamSpec, error) {
-	spec := FKParamSpec{ParamName: paramName, DependencyKey: paramName}
-	switch v := raw.(type) {
-	case bool:
-		if !v {
-			return spec, fmt.Errorf("x-fk boolean value must be true")
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return map[string]string{}
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func (s *Service) buildEffectiveParamValues(opPath string, spec ParamDataSpec, fetchedResponseValues map[string][]interface{}) ([]interface{}, bool, error) {
+	switch spec.Type {
+	case paramDataTypeOperation:
+		values, ok := fetchedResponseValues[spec.OperationID]
+		if !ok {
+			return nil, false, nil
 		}
-		return spec, nil
-	case map[string]any:
-		return parseFKParamSpecMap(spec, map[string]interface{}(v))
-	case string:
-		return spec, fmt.Errorf("x-fk string format is deprecated; use x-fk object with id")
+		filtered, err := applyParamFilter(uniqueValues(values), spec.Filter)
+		if err != nil {
+			return nil, false, fmt.Errorf("%s parameter %s: %w", opPath, spec.ParamName, err)
+		}
+		return filtered, true, nil
+	case paramDataTypeValues:
+		return uniqueValues(spec.Values), true, nil
 	default:
-		return spec, fmt.Errorf("unsupported x-fk type: %T", raw)
+		return nil, false, fmt.Errorf("%s parameter %s: unsupported combination type %q", opPath, spec.ParamName, spec.Type)
 	}
 }
 
@@ -782,109 +849,307 @@ func parseAuthParamSpec(raw interface{}, paramName, in string) (AuthParamSpec, e
 	}, nil
 }
 
-func parseFKParamSpecMap(spec FKParamSpec, m map[string]interface{}) (FKParamSpec, error) {
-	if idRaw, ok := m["id"]; ok {
-		id, ok := idRaw.(string)
-		if !ok || strings.TrimSpace(id) == "" {
-			return spec, fmt.Errorf("x-fk.id must be non-empty string")
-		}
-		spec.DependencyKey = strings.TrimSpace(id)
+func initialPaginationValue(spec *ParamDataSpec) (interface{}, bool) {
+	if spec == nil {
+		return nil, false
 	}
-	if valuesRaw, ok := m["values"]; ok {
-		values, err := parseFilterValuesArray(valuesRaw, "x-fk.values")
+	switch spec.Type {
+	case paramDataTypeCursor:
+		return nil, false
+	case paramDataTypeOffset:
+		if spec.OffsetConfig == nil {
+			return nil, false
+		}
+		return spec.OffsetConfig.Start, true
+	default:
+		return nil, false
+	}
+}
+
+func incrementOffsetValue(current, increment interface{}) (interface{}, error) {
+	currentNum, ok := toNumber(current)
+	if !ok {
+		return nil, fmt.Errorf("offset value must be numeric")
+	}
+	incrementNum, ok := toNumber(increment)
+	if !ok {
+		return nil, fmt.Errorf("offset increment must be numeric")
+	}
+	return currentNum + incrementNum, nil
+}
+
+func extractCursorValue(data []byte, path string) (interface{}, bool) {
+	var payload interface{}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, false
+	}
+	current := payload
+	for _, part := range strings.Split(path, ".") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, false
+		}
+		obj, ok := current.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		next, ok := obj[part]
+		if !ok {
+			return nil, false
+		}
+		current = next
+	}
+	if current == nil {
+		return nil, false
+	}
+	if s, ok := current.(string); ok && strings.TrimSpace(s) == "" {
+		return nil, false
+	}
+	return current, true
+}
+
+func parseResponseDataSpec(extensions map[string]interface{}) (string, bool, error) {
+	if _, legacy := extensions["x-fk"]; legacy {
+		return "", false, fmt.Errorf("x-fk is no longer supported on response properties; use x-response-data")
+	}
+	raw, ok := extensions["x-response-data"]
+	if !ok {
+		return "", false, nil
+	}
+	specMap, ok := raw.(map[string]any)
+	if !ok {
+		return "", false, fmt.Errorf("x-response-data must be object")
+	}
+	idRaw, ok := specMap["id"]
+	if !ok {
+		return "", false, fmt.Errorf("x-response-data.id is required")
+	}
+	id, ok := idRaw.(string)
+	if !ok || strings.TrimSpace(id) == "" {
+		return "", false, fmt.Errorf("x-response-data.id must be non-empty string")
+	}
+	return strings.TrimSpace(id), true, nil
+}
+
+func validateResponseDataHints(opPath string, op *openapi3.Operation) error {
+	resp := (&Service{}).getSuccessResponse(op)
+	if resp == nil || resp.Value == nil {
+		return nil
+	}
+	media := resp.Value.Content.Get("application/json")
+	if media == nil || media.Schema == nil || media.Schema.Value == nil {
+		return nil
+	}
+	var walk func(schema *openapi3.Schema) error
+	walk = func(schema *openapi3.Schema) error {
+		if schema == nil {
+			return nil
+		}
+		if _, _, err := parseResponseDataSpec(schema.Extensions); err != nil {
+			return fmt.Errorf("%s response schema: %w", opPath, err)
+		}
+		if schema.Type != nil && schema.Type.Is("array") && schema.Items != nil {
+			return walk(schema.Items.Value)
+		}
+		if schema.Type != nil && schema.Type.Is("object") {
+			for _, propName := range sortedPropertyNames(schema) {
+				propRef := schema.Properties[propName]
+				if propRef == nil || propRef.Value == nil {
+					continue
+				}
+				if _, _, err := parseResponseDataSpec(propRef.Value.Extensions); err != nil {
+					return fmt.Errorf("%s response property %s: %w", opPath, propName, err)
+				}
+				if err := walk(propRef.Value); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return walk(media.Schema.Value)
+}
+
+func parseParamDataSpec(raw interface{}, paramName string) (ParamDataSpec, error) {
+	spec := ParamDataSpec{ParamName: paramName}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return spec, fmt.Errorf("x-param-data must be object")
+	}
+
+	typeRaw, ok := m["type"]
+	if !ok {
+		return spec, fmt.Errorf("x-param-data.type is required")
+	}
+	typeValue, ok := typeRaw.(string)
+	if !ok || strings.TrimSpace(typeValue) == "" {
+		return spec, fmt.Errorf("x-param-data.type must be non-empty string")
+	}
+	spec.Type = paramDataType(strings.ToLower(strings.TrimSpace(typeValue)))
+
+	switch spec.Type {
+	case paramDataTypeOperation:
+		opIDRaw, ok := m["operation-id"]
+		if !ok {
+			return spec, fmt.Errorf("x-param-data.operation-id is required for type=operation")
+		}
+		opID, ok := opIDRaw.(string)
+		if !ok || strings.TrimSpace(opID) == "" {
+			return spec, fmt.Errorf("x-param-data.operation-id must be non-empty string")
+		}
+		spec.OperationID = strings.TrimSpace(opID)
+		if filterRaw, ok := m["filter"]; ok {
+			filter, err := parseFilterSpec(filterRaw)
+			if err != nil {
+				return spec, err
+			}
+			spec.Filter = filter
+		}
+	case paramDataTypeValues:
+		valuesRaw, ok := m["values"]
+		if !ok {
+			return spec, fmt.Errorf("x-param-data.values is required for type=values")
+		}
+		values, err := parseFilterValuesArray(valuesRaw, "x-param-data.values")
 		if err != nil {
 			return spec, err
 		}
-		spec.SeedValues = uniqueValues(values)
-	}
-	if filterRaw, ok := m["filter"]; ok {
-		filter, err := parseFilterSpec(filterRaw)
-		if err != nil {
-			return spec, err
+		spec.Values = uniqueValues(values)
+	case paramDataTypeCursor:
+		cursorRaw, ok := m["cursor"]
+		if !ok {
+			return spec, fmt.Errorf("x-param-data.cursor is required for type=cursor")
 		}
-		spec.Filter = filter
+		cursorPath, ok := cursorRaw.(string)
+		if !ok || strings.TrimSpace(cursorPath) == "" {
+			return spec, fmt.Errorf("x-param-data.cursor must be non-empty string")
+		}
+		spec.CursorPath = strings.TrimSpace(cursorPath)
+	case paramDataTypeOffset:
+		offsetRaw, ok := m["offset"]
+		if !ok {
+			return spec, fmt.Errorf("x-param-data.offset is required for type=offset")
+		}
+		offsetMap, ok := offsetRaw.(map[string]any)
+		if !ok {
+			return spec, fmt.Errorf("x-param-data.offset must be object")
+		}
+		start, ok := offsetMap["start"]
+		if !ok {
+			return spec, fmt.Errorf("x-param-data.offset.start is required")
+		}
+		increment, ok := offsetMap["increment"]
+		if !ok {
+			return spec, fmt.Errorf("x-param-data.offset.increment is required")
+		}
+		spec.OffsetConfig = &OffsetParamSpec{Start: start, Increment: increment}
+	default:
+		return spec, fmt.Errorf("unsupported x-param-data.type: %s", spec.Type)
 	}
 	return spec, nil
 }
 
-func validateFKSpec(spec FKParamSpec) error {
+func validateParamDataSpec(spec ParamDataSpec) error {
 	if strings.TrimSpace(spec.ParamName) == "" {
 		return fmt.Errorf("parameter name is required")
 	}
-	if strings.TrimSpace(spec.DependencyKey) == "" {
-		return fmt.Errorf("x-fk dependency key is required")
-	}
-	for _, v := range spec.SeedValues {
-		if !isSupportedFKValue(v) {
-			return fmt.Errorf("x-fk.values supports only scalar or array values")
+	switch spec.Type {
+	case paramDataTypeOperation:
+		if strings.TrimSpace(spec.OperationID) == "" {
+			return fmt.Errorf("x-param-data.operation-id is required for type=operation")
 		}
+	case paramDataTypeValues:
+		if len(spec.Values) == 0 {
+			return fmt.Errorf("x-param-data.values must be non-empty")
+		}
+		for _, v := range spec.Values {
+			if !isSupportedParamValue(v) {
+				return fmt.Errorf("x-param-data.values supports only scalar or array values")
+			}
+		}
+	case paramDataTypeCursor:
+		if strings.TrimSpace(spec.CursorPath) == "" {
+			return fmt.Errorf("x-param-data.cursor is required for type=cursor")
+		}
+	case paramDataTypeOffset:
+		if spec.OffsetConfig == nil {
+			return fmt.Errorf("x-param-data.offset is required for type=offset")
+		}
+		if _, ok := toNumber(spec.OffsetConfig.Start); !ok {
+			return fmt.Errorf("x-param-data.offset.start must be numeric")
+		}
+		if _, ok := toNumber(spec.OffsetConfig.Increment); !ok {
+			return fmt.Errorf("x-param-data.offset.increment must be numeric")
+		}
+	default:
+		return fmt.Errorf("unsupported x-param-data.type: %s", spec.Type)
 	}
 	return nil
 }
 
-func parseFilterSpec(raw interface{}) (*FKFilterSpec, error) {
+func parseFilterSpec(raw interface{}) (*ParamFilterSpec, error) {
 	filterMap, ok := raw.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("x-fk.filter must be object")
+		return nil, fmt.Errorf("x-param-data.filter must be object")
 	}
 	opRaw, ok := filterMap["op"]
 	if !ok {
-		return nil, fmt.Errorf("x-fk.filter.op is required")
+		return nil, fmt.Errorf("x-param-data.filter.op is required")
 	}
 	op, ok := opRaw.(string)
 	if !ok || strings.TrimSpace(op) == "" {
-		return nil, fmt.Errorf("x-fk.filter.op must be non-empty string")
+		return nil, fmt.Errorf("x-param-data.filter.op must be non-empty string")
 	}
 	op = strings.ToLower(strings.TrimSpace(op))
 
-	spec := &FKFilterSpec{Op: op}
+	spec := &ParamFilterSpec{Op: op}
 	switch op {
 	case filterOpIn:
 		valuesRaw, ok := filterMap["values"]
 		if !ok {
-			return nil, fmt.Errorf("x-fk.filter.values is required for 'in'")
+			return nil, fmt.Errorf("x-param-data.filter.values is required for 'in'")
 		}
-		values, err := parseFilterValuesArray(valuesRaw, "x-fk.filter.values")
+		values, err := parseFilterValuesArray(valuesRaw, "x-param-data.filter.values")
 		if err != nil {
 			return nil, err
 		}
 		if len(values) == 0 {
-			return nil, fmt.Errorf("x-fk.filter.values must be non-empty")
+			return nil, fmt.Errorf("x-param-data.filter.values must be non-empty")
 		}
 		if _, hasValue := filterMap["value"]; hasValue {
-			return nil, fmt.Errorf("x-fk.filter.value is not allowed for 'in'")
+			return nil, fmt.Errorf("x-param-data.filter.value is not allowed for 'in'")
 		}
 		spec.Values = uniqueValues(values)
 	case filterOpGT, filterOpGTE, filterOpLT, filterOpLTE:
 		valueRaw, ok := filterMap["value"]
 		if !ok {
-			return nil, fmt.Errorf("x-fk.filter.value is required for '%s'", op)
+			return nil, fmt.Errorf("x-param-data.filter.value is required for '%s'", op)
 		}
 		if !isScalarValue(valueRaw) {
-			return nil, fmt.Errorf("x-fk.filter.value must be scalar")
+			return nil, fmt.Errorf("x-param-data.filter.value must be scalar")
 		}
 		if _, hasValues := filterMap["values"]; hasValues {
-			return nil, fmt.Errorf("x-fk.filter.values is not allowed for '%s'", op)
+			return nil, fmt.Errorf("x-param-data.filter.values is not allowed for '%s'", op)
 		}
 		if _, ok := toNumber(valueRaw); !ok {
 			if _, ok := toRFC3339Time(valueRaw); !ok {
-				return nil, fmt.Errorf("x-fk.filter.value for '%s' must be numeric or RFC3339 datetime string", op)
+				return nil, fmt.Errorf("x-param-data.filter.value for '%s' must be numeric or RFC3339 datetime string", op)
 			}
 		}
 		spec.Value = valueRaw
 	default:
-		return nil, fmt.Errorf("unsupported x-fk.filter.op: %s", op)
+		return nil, fmt.Errorf("unsupported x-param-data.filter.op: %s", op)
 	}
 	return spec, nil
 }
 
-func applyFKFilter(values []interface{}, filter *FKFilterSpec) ([]interface{}, error) {
+func applyParamFilter(values []interface{}, filter *ParamFilterSpec) ([]interface{}, error) {
 	if filter == nil {
 		return values, nil
 	}
 	filtered := make([]interface{}, 0, len(values))
 	for _, candidate := range values {
-		ok, err := matchFKFilter(candidate, filter)
+		ok, err := matchParamFilter(candidate, filter)
 		if err != nil {
 			return nil, err
 		}
@@ -895,7 +1160,7 @@ func applyFKFilter(values []interface{}, filter *FKFilterSpec) ([]interface{}, e
 	return filtered, nil
 }
 
-func matchFKFilter(candidate interface{}, filter *FKFilterSpec) (bool, error) {
+func matchParamFilter(candidate interface{}, filter *ParamFilterSpec) (bool, error) {
 	switch filter.Op {
 	case filterOpIn:
 		for _, accepted := range filter.Values {
@@ -1024,7 +1289,7 @@ func parseFilterValuesArray(raw interface{}, fieldName string) ([]interface{}, e
 	}
 	values := make([]interface{}, 0, len(items))
 	for _, item := range items {
-		if !isSupportedFKValue(item) {
+		if !isSupportedParamValue(item) {
 			return nil, fmt.Errorf("%s supports only scalar or array values", fieldName)
 		}
 		values = append(values, item)
@@ -1043,7 +1308,7 @@ func isScalarValue(v interface{}) bool {
 	}
 }
 
-func isSupportedFKValue(v interface{}) bool {
+func isSupportedParamValue(v interface{}) bool {
 	if isScalarValue(v) {
 		return true
 	}
@@ -1052,7 +1317,7 @@ func isSupportedFKValue(v interface{}) bool {
 		return false
 	}
 	for _, item := range arr {
-		if !isSupportedFKValue(item) {
+		if !isSupportedParamValue(item) {
 			return false
 		}
 	}

@@ -141,7 +141,7 @@ func TestGeneratePlanWaitsForLaterDependencyProducer(t *testing.T) {
 	}
 
 	publicationIDField := openapi3.NewIntegerSchema()
-	publicationIDField.Extensions = map[string]any{"x-fk": "publicationId"}
+	publicationIDField.Extensions = map[string]any{"x-response-data": map[string]any{"id": "publicationId"}}
 	publicationsSchema := openapi3.NewArraySchema().WithItems(
 		openapi3.NewObjectSchema().WithProperty("id", publicationIDField),
 	)
@@ -161,7 +161,7 @@ func TestGeneratePlanWaitsForLaterDependencyProducer(t *testing.T) {
 		WithRequired(true).
 		WithSchema(openapi3.NewIntegerSchema())
 	paramPublicationID.Extensions = map[string]any{
-		"x-fk": map[string]any{"id": "publicationId"},
+		"x-param-data": map[string]any{"type": "operation", "operation-id": "publicationId"},
 	}
 	datasetsOp := &openapi3.Operation{
 		Extensions: map[string]any{"x-res-type": "one-shot"},
@@ -362,7 +362,7 @@ func TestGeneratePlanAuthOverridesFKValue(t *testing.T) {
 	}
 
 	tokenField := openapi3.NewStringSchema()
-	tokenField.Extensions = map[string]any{"x-fk": "token"}
+	tokenField.Extensions = map[string]any{"x-response-data": map[string]any{"id": "token"}}
 	upstreamOp := &openapi3.Operation{
 		Extensions: map[string]any{"x-res-type": "one-shot"},
 		Responses:  responseWithJSONSchema("#/components/schemas/upstream", openapi3.NewArraySchema().WithItems(openapi3.NewObjectSchema().WithProperty("token", tokenField))),
@@ -370,8 +370,8 @@ func TestGeneratePlanAuthOverridesFKValue(t *testing.T) {
 
 	tokenParam := openapi3.NewQueryParameter("token").WithRequired(true).WithSchema(openapi3.NewStringSchema())
 	tokenParam.Extensions = map[string]any{
-		"x-fk":   true,
-		"x-auth": "PUBLICATION_TOKEN",
+		"x-param-data": map[string]any{"type": "operation", "operation-id": "token"},
+		"x-auth":       "PUBLICATION_TOKEN",
 	}
 	secureOp := &openapi3.Operation{
 		Extensions: map[string]any{"x-res-type": "one-shot"},
@@ -398,7 +398,7 @@ func TestGeneratePlanAuthOverridesFKValue(t *testing.T) {
 		t.Fatalf("expected one secure request, got %d", len(api.requests["/secure"]))
 	}
 	if api.requests["/secure"][0].QueryParams["token"] != "from-env" {
-		t.Fatalf("expected x-auth to override x-fk, got %q", api.requests["/secure"][0].QueryParams["token"])
+		t.Fatalf("expected x-auth to override x-param-data, got %q", api.requests["/secure"][0].QueryParams["token"])
 	}
 	if !api.requests["/secure"][0].SensitiveQuery["token"] {
 		t.Fatalf("expected auth query param to be marked sensitive")
@@ -514,12 +514,143 @@ func TestGeneratePlanMarkedModeRecursiveInserts(t *testing.T) {
 	}
 }
 
+func TestGeneratePlanCursorPagination(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/paged": func(req FetchRequest) ([]byte, error) {
+				switch req.QueryParams["cursor"] {
+				case "":
+					return []byte(`{"id":1,"next":{"cursor":"abc"}}`), nil
+				case "abc":
+					return []byte(`{"id":2,"next":{"cursor":""}}`), nil
+				default:
+					return nil, fmt.Errorf("unexpected cursor %q", req.QueryParams["cursor"])
+				}
+			},
+		},
+	}
+
+	itemsSchema := openapi3.NewObjectSchema().
+		WithProperty("id", withPK(openapi3.NewIntegerSchema())).
+		WithProperty("next", openapi3.NewObjectSchema().WithProperty("cursor", openapi3.NewStringSchema()))
+
+	cursorParam := openapi3.NewQueryParameter("cursor").WithSchema(openapi3.NewStringSchema())
+	cursorParam.Extensions = map[string]any{"x-param-data": map[string]any{"type": "cursor", "cursor": "next.cursor"}}
+
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/paged", &openapi3.PathItem{Get: &openapi3.Operation{
+				Extensions: map[string]any{"x-res-type": "one-shot"},
+				Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: cursorParam}},
+				Responses:  responseWithJSONSchema("#/components/schemas/items", itemsSchema),
+			}}),
+		),
+	}
+
+	service := NewService(api)
+	plan, err := service.GeneratePlan(context.Background(), spec, "https://example.com")
+	if err != nil {
+		t.Fatalf("GeneratePlan returned error: %v", err)
+	}
+
+	if !slices.Equal(api.seen["/paged"], []string{"abc"}) {
+		t.Fatalf("expected second paginated request marker, got %v", api.seen["/paged"])
+	}
+
+	var rowCount int
+	for _, op := range plan.Operations {
+		insert, ok := op.(InsertRowsOp)
+		if ok && insert.TableName == "items" {
+			rowCount += len(insert.Rows)
+		}
+	}
+	if rowCount != 2 {
+		t.Fatalf("expected 2 inserted rows across pages, got %d", rowCount)
+	}
+}
+
+func TestGeneratePlanOffsetPaginationPerDependencyCombination(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/sources": func(req FetchRequest) ([]byte, error) {
+				return []byte(`[{"id":10},{"id":20}]`), nil
+			},
+			"/paged": func(req FetchRequest) ([]byte, error) {
+				key := req.QueryParams["sourceId"] + ":" + req.QueryParams["offset"]
+				switch key {
+				case "10:0":
+					return []byte(`[{"value":"a"}]`), nil
+				case "10:1":
+					return []byte(`[]`), nil
+				case "20:0":
+					return []byte(`[{"value":"b"}]`), nil
+				case "20:1":
+					return []byte(`[]`), nil
+				default:
+					return nil, fmt.Errorf("unexpected request %s", key)
+				}
+			},
+		},
+	}
+
+	sourceIDField := openapi3.NewIntegerSchema()
+	sourceIDField.Extensions = map[string]any{"x-response-data": map[string]any{"id": "sourceId"}}
+	sourceSchema := openapi3.NewArraySchema().WithItems(openapi3.NewObjectSchema().WithProperty("id", sourceIDField))
+
+	sourceParam := openapi3.NewQueryParameter("sourceId").WithRequired(true).WithSchema(openapi3.NewIntegerSchema())
+	sourceParam.Extensions = map[string]any{"x-param-data": map[string]any{"type": "operation", "operation-id": "sourceId"}}
+
+	offsetParam := openapi3.NewQueryParameter("offset").WithSchema(openapi3.NewIntegerSchema())
+	offsetParam.Extensions = map[string]any{"x-param-data": map[string]any{"type": "offset", "offset": map[string]any{"start": 0, "increment": 1}}}
+
+	pagedSchema := openapi3.NewArraySchema().WithItems(openapi3.NewObjectSchema().WithProperty("value", openapi3.NewStringSchema()))
+
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/paged", &openapi3.PathItem{Get: &openapi3.Operation{
+				Extensions: map[string]any{"x-res-type": "one-shot"},
+				Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: sourceParam}, &openapi3.ParameterRef{Value: offsetParam}},
+				Responses:  responseWithJSONSchema("#/components/schemas/paged", pagedSchema),
+			}}),
+			openapi3.WithPath("/sources", &openapi3.PathItem{Get: &openapi3.Operation{
+				Extensions: map[string]any{"x-res-type": "one-shot"},
+				Responses:  responseWithJSONSchema("#/components/schemas/sources", sourceSchema),
+			}}),
+		),
+	}
+
+	service := NewService(api)
+	plan, err := service.GeneratePlan(context.Background(), spec, "https://example.com")
+	if err != nil {
+		t.Fatalf("GeneratePlan returned error: %v", err)
+	}
+
+	if got := api.seen["/paged"]; len(got) != 4 {
+		t.Fatalf("expected 4 paginated calls, got %v", got)
+	}
+
+	var rowCount int
+	for _, op := range plan.Operations {
+		insert, ok := op.(InsertRowsOp)
+		if ok && insert.TableName == "paged" {
+			rowCount += len(insert.Rows)
+		}
+	}
+	if rowCount != 2 {
+		t.Fatalf("expected 2 inserted rows across combinations, got %d", rowCount)
+	}
+}
+
 func buildThreeStepSpec() *openapi3.T {
 	id1Field := openapi3.NewIntegerSchema()
-	id1Field.Extensions = map[string]any{"x-fk": "id1"}
+	id1Field.Extensions = map[string]any{"x-response-data": map[string]any{"id": "id1"}}
 
 	id2Field := openapi3.NewIntegerSchema()
-	id2Field.Extensions = map[string]any{"x-fk": "id2"}
+	id2Field.Extensions = map[string]any{"x-response-data": map[string]any{"id": "id2"}}
 
 	op1Schema := openapi3.NewArraySchema().WithItems(openapi3.NewObjectSchema().WithProperty("id1", id1Field))
 	op2Schema := openapi3.NewArraySchema().WithItems(openapi3.NewObjectSchema().WithProperty("id2", id2Field))
@@ -531,7 +662,7 @@ func buildThreeStepSpec() *openapi3.T {
 	}
 
 	paramID1 := openapi3.NewQueryParameter("id1").WithRequired(true).WithSchema(openapi3.NewIntegerSchema())
-	paramID1.Extensions = map[string]any{"x-fk": true}
+	paramID1.Extensions = map[string]any{"x-param-data": map[string]any{"type": "operation", "operation-id": "id1"}}
 	op2 := &openapi3.Operation{
 		Extensions: map[string]any{"x-res-type": "one-shot"},
 		Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: paramID1}},
@@ -539,7 +670,7 @@ func buildThreeStepSpec() *openapi3.T {
 	}
 
 	paramID2 := openapi3.NewQueryParameter("id2").WithRequired(true).WithSchema(openapi3.NewIntegerSchema())
-	paramID2.Extensions = map[string]any{"x-fk": true}
+	paramID2.Extensions = map[string]any{"x-param-data": map[string]any{"type": "operation", "operation-id": "id2"}}
 	op3 := &openapi3.Operation{
 		Extensions: map[string]any{"x-res-type": "one-shot"},
 		Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: paramID2}},

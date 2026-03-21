@@ -14,7 +14,7 @@ With the default Postgres adapter it still generates PostgreSQL SQL such as:
 
 It can:
 
-- resolve endpoint dependencies with `x-fk`
+- resolve endpoint dependencies with `x-param-data` + `x-response-data`
 - inject env-backed auth parameters with `x-auth`
 - fetch in dependency order
 - flatten marked nested response objects into separate tables (`x-table-name`)
@@ -94,38 +94,59 @@ Marks a GET operation as fetchable by parser.
 
 Without `x-res-type`, operation is ignored.
 
-### `x-fk` (operation parameter)
+### `x-param-data` (operation parameter)
 
-Controls dependency-driven parameter value generation.
+Controls generated request parameter values.
 
 Supported forms:
 
 ```yaml
-# Simple mode
-x-fk: true
+x-param-data:
+  type: operation
+  operation-id: publicationId
+  filter:
+    op: in
+    values: [2, 3]
 ```
 
 ```yaml
-# Extended mode
-x-fk:
-  id: publicationId     # optional, defaults to parameter name
-  values: [1, 2, 3]     # optional seed values (scalars or arrays)
-  filter:               # optional
-    op: in              # in | gt | gte | lt | lte
-    values: [2, 3]      # required for op=in
+x-param-data:
+  type: values
+  values: [1, 2, 3]
+```
+
+```yaml
+x-param-data:
+  type: cursor
+  cursor: next.cursor
+```
+
+```yaml
+x-param-data:
+  type: offset
+  offset:
+    start: 0
+    increment: 100
 ```
 
 Rules:
 
-1. `x-fk: "..."` string format is rejected for parameters.
-2. Candidate values per FK param are:
-   - fetched values by `id`
-   - union with optional `values`
-3. Filter is applied before cartesian product.
-4. `gt/gte/lt/lte` support:
-   - numeric values
-   - strict RFC3339 datetime strings
-5. If any FK param has an empty candidate set after filtering, operation is skipped (no requests).
+1. Old `x-fk` parameter hints are rejected.
+2. `type=operation` pulls values published by response properties via `x-response-data.id`.
+3. `type=values` uses only local `values`.
+4. `type=operation` supports optional `filter` with `in | gt | gte | lt | lte`.
+5. At most one pagination param (`cursor` or `offset`) is allowed per operation.
+6. Cursor pagination stops when the configured dot-path is missing, null, or empty.
+7. Offset pagination starts at `offset.start`, increments by `offset.increment`, and stops when a page produces no insertable rows.
+
+### `x-response-data` (response property)
+
+Publishes response values for downstream `x-param-data.type=operation` parameters.
+
+```yaml
+x-response-data:
+  id: publicationId
+```
 
 ### `x-auth` (operation parameter)
 
@@ -148,7 +169,7 @@ Rules:
 1. `x-auth` must be a non-empty string.
 2. Supported parameter locations are `header` and `query`.
 3. The value is read from the named environment variable for every request.
-4. If a parameter has both `x-auth` and `x-fk`, `x-auth` wins.
+4. If a parameter has both `x-auth` and `x-param-data`, `x-auth` wins.
 5. If the env var is missing, that operation is skipped and a warning is logged.
 6. Auth-backed parameter values are always redacted in request logs.
 
@@ -180,18 +201,19 @@ If at least one `x-table-name` exists in an operation response schema, parser sw
 
 For fetchable operations (`x-res-type`):
 
-1. Build operation FK specs from parameter `x-fk`.
+1. Build operation parameter specs from `x-param-data`.
 2. Resolve auth-backed parameter specs from `x-auth`.
-3. For each op, build FK candidate lists.
-4. Build cartesian product of FK lists.
+3. For each op, build candidate lists for `operation` and `values` params.
+4. Build cartesian product of candidate lists.
 5. Request operation for each combination, injecting auth values from env when configured.
-6. Extract FK values from responses and feed downstream operations.
+6. If pagination is configured, keep requesting that combination until pagination stops.
+7. Extract response-published values from `x-response-data` and feed downstream operations.
 
-Operations without any `x-fk` are called once with empty parameter combination.
+Operations without any combination-producing `x-param-data` are called once with empty parameter combination.
 
 ## Request Parameter Serialization Notes
 
-For generated FK parameter values:
+For generated parameter values:
 
 - values are converted via `fmt.Sprintf("%v", value)` before request build
 - query params are set with `url.Values.Set(...)`
@@ -238,4 +260,4 @@ Example line:
 ## Project Examples
 
 - `example/api.json`: minimal dependency chain sample
-- `example/binance.json`: real-world endpoint with `x-fk` seeds + `x-table-name`
+- `example/binance.json`: real-world endpoint with `x-param-data` seeds/pagination + `x-table-name`

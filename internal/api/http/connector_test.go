@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	nethttp "net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -159,5 +160,89 @@ func TestConnectorRetriesOnServerError(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+}
+
+func TestConnectorReturnsTransportErrorAndLogsFailure(t *testing.T) {
+	logger := &collectingLogger{}
+	cfg := config.APIConfig{
+		MaxRPM:         1000,
+		RequestTimeout: time.Second,
+		Retries: config.RetryConfig{
+			ErrorsMaxRetries:  3,
+			BasicRetryTimeout: time.Millisecond,
+		},
+	}
+	client := &nethttp.Client{
+		Transport: roundTripFunc(func(req *nethttp.Request) (*nethttp.Response, error) {
+			return nil, io.ErrUnexpectedEOF
+		}),
+	}
+
+	conn := newConnector(cfg, logger, client)
+	_, err := conn.Fetch(context.Background(), core.FetchRequest{
+		Method:  nethttp.MethodGet,
+		BaseURL: "https://api.example.com",
+		Path:    "/health",
+	})
+	if err == nil || !strings.Contains(err.Error(), "unexpected EOF") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(logger.events) != 1 {
+		t.Fatalf("expected one log event, got %d", len(logger.events))
+	}
+	if logger.events[0].StatusCode != -1 || logger.events[0].Err == nil {
+		t.Fatalf("expected transport failure to be logged, got %+v", logger.events[0])
+	}
+}
+
+func TestConnectorStopsAfterRetryExhaustion(t *testing.T) {
+	attempts := 0
+	cfg := config.APIConfig{
+		MaxRPM:         1000,
+		RequestTimeout: 2 * time.Second,
+		Retries: config.RetryConfig{
+			ErrorsMaxRetries:  1,
+			BasicRetryTimeout: time.Millisecond,
+		},
+	}
+	client := &nethttp.Client{
+		Transport: roundTripFunc(func(req *nethttp.Request) (*nethttp.Response, error) {
+			attempts++
+			return &nethttp.Response{
+				StatusCode: 500,
+				Body:       io.NopCloser(bytes.NewBufferString(`fail`)),
+				Header:     make(nethttp.Header),
+			}, nil
+		}),
+	}
+
+	conn := newConnector(cfg, observability.NopRequestLogger{}, client)
+	_, err := conn.Fetch(context.Background(), core.FetchRequest{
+		Method:  nethttp.MethodGet,
+		BaseURL: "https://api.example.com",
+		Path:    "/health",
+	})
+	if err == nil || err.Error() != "unexpected status code 500: fail" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts after one retry, got %d", attempts)
+	}
+}
+
+func TestNewConnectorUsesConfiguredTimeout(t *testing.T) {
+	cfg := config.APIConfig{
+		MaxRPM:         0,
+		RequestTimeout: 7 * time.Second,
+	}
+
+	conn := newConnector(cfg, observability.NopRequestLogger{}, nil)
+
+	if conn.client.Timeout != 7*time.Second {
+		t.Fatalf("unexpected client timeout: %v", conn.client.Timeout)
+	}
+	if conn.rateLimit == nil || conn.rateLimit.maxRPM != 60 {
+		t.Fatalf("expected default rate limiter max RPM, got %+v", conn.rateLimit)
 	}
 }

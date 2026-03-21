@@ -9,4 +9,5 @@ api:
     basic_retry_timeout: 2
 
 database:
-  connection_string: host=localhost user=postgres password=postgres dbname=postgres port=5440 sslmode=disable
+  provider: clickhouse
+  connection_string: host=localhost user=postgres password=postgres dbname=postgres port=5440

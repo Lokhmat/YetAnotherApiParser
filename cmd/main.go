@@ -7,6 +7,9 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"api-parser/internal/api"
 	_ "api-parser/internal/api/http"
@@ -17,6 +20,7 @@ import (
 	_ "api-parser/internal/db/postgres"
 	"api-parser/internal/observability"
 	"api-parser/internal/openapi"
+	"github.com/getkin/kin-openapi/openapi3"
 )
 
 var (
@@ -26,13 +30,27 @@ var (
 	newDBTarget      = db.New
 	loadOpenAPI      = openapi.Load
 	writeFile        = os.WriteFile
+	sleepWithContext = func(ctx context.Context, delay time.Duration) error {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+			return nil
+		}
+	}
 )
 
 func main() {
 	configPath := flag.String("config", "conf.yaml", "config path")
 	flag.Parse()
 
-	if err := run(context.Background(), *configPath, os.Stdout); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, *configPath, os.Stdout); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -61,6 +79,50 @@ func run(ctx context.Context, configPath string, out io.Writer) error {
 	fmt.Fprintf(out, "Base URL: %s\n", cfg.API.BaseURL)
 
 	service := core.NewService(apiConnector)
+	if !cfg.Runtime.FullReloadEnabled {
+		return runOneShot(ctx, out, cfg, spec, service, dbTarget)
+	}
+
+	if !dbTarget.Capabilities().CanFullSync {
+		return fmt.Errorf("db provider %q does not support periodic full reload", cfg.Database.Provider)
+	}
+
+	fmt.Fprintf(out, "Periodic full reload enabled: every %ds\n", cfg.Runtime.FullReloadIntervalSeconds)
+
+	for cycle := 1; ; cycle++ {
+		fullSyncPlan, err := service.GenerateFullSyncPlan(ctx, spec, cfg.API.BaseURL)
+		if err != nil {
+			return fmt.Errorf("generate full sync plan: %w", err)
+		}
+
+		sqlBytes, err := dbTarget.ExportFullSyncSQL(fullSyncPlan)
+		if err != nil {
+			return fmt.Errorf("export full sync sql: %w", err)
+		}
+		result, err := dbTarget.ApplyFullSync(ctx, fullSyncPlan)
+		if err != nil {
+			log.Printf("periodic full reload cycle %d failed: %v", cycle, err)
+			if len(sqlBytes) > 0 {
+				log.Printf("saving full sync SQL to %s...", cfg.Runtime.SQLOutputPath)
+				if writeErr := writeFile(cfg.Runtime.SQLOutputPath, sqlBytes, 0644); writeErr != nil {
+					return fmt.Errorf("failed to write migrations to file: %w", writeErr)
+				}
+				fmt.Fprintf(out, "Migrations saved to %s\n", cfg.Runtime.SQLOutputPath)
+			}
+		} else {
+			fmt.Fprintf(out, "Full reload cycle %d applied %d statements\n", cycle, result.AppliedCount)
+		}
+
+		if err := sleepWithContext(ctx, cfg.Runtime.FullReloadInterval); err != nil {
+			if err == context.Canceled {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func runOneShot(ctx context.Context, out io.Writer, cfg config.Config, spec *openapi3.T, service *core.Service, dbTarget core.MigrationTarget) error {
 	plan, err := service.GeneratePlan(ctx, spec, cfg.API.BaseURL)
 	if err != nil {
 		return fmt.Errorf("generate migration plan: %w", err)

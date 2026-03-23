@@ -24,7 +24,7 @@ func init() {
 }
 
 func (a *adapter) Capabilities() core.Capabilities {
-	return core.Capabilities{CanExportSQL: true}
+	return core.Capabilities{CanExportSQL: true, CanFullSync: true}
 }
 
 func (a *adapter) ExportSQL(plan *core.MigrationPlan) ([]byte, error) {
@@ -92,9 +92,70 @@ func (a *adapter) Apply(ctx context.Context, plan *core.MigrationPlan) (core.App
 	return core.ApplyResult{AppliedCount: applied}, nil
 }
 
+func (a *adapter) ExportFullSyncSQL(plan *core.FullSyncPlan) ([]byte, error) {
+	if plan == nil {
+		return nil, nil
+	}
+
+	lines := make([]string, 0)
+	for _, table := range plan.Tables {
+		lines = append(lines, renderFullSyncCreateTable(table))
+	}
+	for _, table := range plan.Tables {
+		lines = append(lines, renderFullSyncUpserts(table)...)
+	}
+	for i := len(plan.Tables) - 1; i >= 0; i-- {
+		lines = append(lines, renderFullSyncDelete(plan.Tables[i]))
+	}
+	if len(lines) == 0 {
+		return nil, nil
+	}
+	return []byte(strings.Join(lines, "\n\n")), nil
+}
+
+func (a *adapter) ApplyFullSync(ctx context.Context, plan *core.FullSyncPlan) (core.ApplyResult, error) {
+	sqlBytes, err := a.ExportFullSyncSQL(plan)
+	if err != nil {
+		return core.ApplyResult{}, err
+	}
+	if len(sqlBytes) == 0 {
+		return core.ApplyResult{}, nil
+	}
+
+	conn, err := sql.Open("postgres", a.connectionString)
+	if err != nil {
+		return core.ApplyResult{}, fmt.Errorf("open database: %w", err)
+	}
+	defer conn.Close()
+
+	if err := conn.PingContext(ctx); err != nil {
+		return core.ApplyResult{}, fmt.Errorf("ping database: %w", err)
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return core.ApplyResult{}, fmt.Errorf("begin transaction: %w", err)
+	}
+	applied := 0
+	for _, stmt := range splitStatements(string(sqlBytes)) {
+		if strings.TrimSpace(stmt) == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			_ = tx.Rollback()
+			return core.ApplyResult{AppliedCount: applied}, fmt.Errorf("exec full sync: %w", err)
+		}
+		applied++
+	}
+	if err := tx.Commit(); err != nil {
+		return core.ApplyResult{AppliedCount: applied}, fmt.Errorf("commit full sync: %w", err)
+	}
+	return core.ApplyResult{AppliedCount: applied}, nil
+}
+
 func renderCreateTable(op core.CreateTableOp) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("CREATE TABLE %s (\n", op.TableName))
+	b.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", op.TableName))
 	for i, col := range op.Columns {
 		if i > 0 {
 			b.WriteString(",\n")
@@ -111,12 +172,16 @@ func renderCreateTable(op core.CreateTableOp) string {
 }
 
 func renderCreateLinkTable(op core.CreateLinkTableOp) string {
+	leftPK, rightPK := op.LeftColumn, op.RightColumn
+	if len(op.PrimaryKey) >= 2 {
+		leftPK, rightPK = op.PrimaryKey[0], op.PrimaryKey[1]
+	}
 	return fmt.Sprintf(
-		"CREATE TABLE %s (\n  %s %s NOT NULL,\n  %s %s NOT NULL,\n  PRIMARY KEY (%s, %s)\n);",
+		"CREATE TABLE IF NOT EXISTS %s (\n  %s %s NOT NULL,\n  %s %s NOT NULL,\n  PRIMARY KEY (%s, %s)\n);",
 		op.TableName,
 		op.LeftColumn, op.LeftType,
 		op.RightColumn, op.RightType,
-		op.LeftColumn, op.RightColumn,
+		leftPK, rightPK,
 	)
 }
 
@@ -264,4 +329,85 @@ func splitStatements(sqlText string) []string {
 		stmts = append(stmts, stmt)
 	}
 	return stmts
+}
+
+func renderFullSyncCreateTable(table core.FullSyncTable) string {
+	return renderCreateTable(core.CreateTableOp{
+		TableName: table.Name,
+		Columns:   table.Columns,
+	})
+}
+
+func renderFullSyncUpserts(table core.FullSyncTable) []string {
+	lines := make([]string, 0, len(table.Rows))
+	for _, row := range table.Rows {
+		values := make([]string, 0, len(row.Values))
+		for _, value := range row.Values {
+			values = append(values, toSQLLiteral(value))
+		}
+		lines = append(lines, fmt.Sprintf(
+			"INSERT INTO %s (%s) VALUES (%s)%s;",
+			table.Name,
+			strings.Join(row.Columns, ", "),
+			strings.Join(values, ", "),
+			renderConflictClause(table, row.Columns),
+		))
+	}
+	return lines
+}
+
+func renderConflictClause(table core.FullSyncTable, rowColumns []string) string {
+	if len(table.PrimaryKey) == 0 {
+		return ""
+	}
+	updates := make([]string, 0)
+	pkSet := make(map[string]struct{}, len(table.PrimaryKey))
+	for _, pk := range table.PrimaryKey {
+		pkSet[pk] = struct{}{}
+	}
+	for _, col := range rowColumns {
+		if _, ok := pkSet[col]; ok {
+			continue
+		}
+		updates = append(updates, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
+	}
+	if len(updates) == 0 {
+		return fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", strings.Join(table.PrimaryKey, ", "))
+	}
+	return fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", strings.Join(table.PrimaryKey, ", "), strings.Join(updates, ", "))
+}
+
+func renderFullSyncDelete(table core.FullSyncTable) string {
+	if len(table.Rows) == 0 {
+		return fmt.Sprintf("DELETE FROM %s;", table.Name)
+	}
+
+	clauses := make([]string, 0, len(table.Rows))
+	for _, row := range table.Rows {
+		pkClauses := make([]string, 0, len(table.PrimaryKey))
+		for _, pk := range table.PrimaryKey {
+			index := indexOfColumn(row.Columns, pk)
+			if index == -1 || index >= len(row.Values) {
+				continue
+			}
+			pkClauses = append(pkClauses, fmt.Sprintf("%s = %s", pk, toSQLLiteral(row.Values[index])))
+		}
+		if len(pkClauses) == 0 {
+			continue
+		}
+		clauses = append(clauses, "("+strings.Join(pkClauses, " AND ")+")")
+	}
+	if len(clauses) == 0 {
+		return fmt.Sprintf("DELETE FROM %s;", table.Name)
+	}
+	return fmt.Sprintf("DELETE FROM %s WHERE NOT (%s);", table.Name, strings.Join(clauses, " OR "))
+}
+
+func indexOfColumn(columns []string, target string) int {
+	for i, col := range columns {
+		if col == target {
+			return i
+		}
+	}
+	return -1
 }

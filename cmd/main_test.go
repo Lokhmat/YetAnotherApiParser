@@ -9,67 +9,90 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"api-parser/internal/api"
 	"api-parser/internal/config"
 	"api-parser/internal/core"
-	"api-parser/internal/db"
 	"api-parser/internal/observability"
 )
 
-type cmdFakeConnector struct{}
+type cmdFakeConnector struct {
+	payload []byte
+}
 
-func (cmdFakeConnector) Fetch(context.Context, core.FetchRequest) (core.FetchResult, error) {
-	return core.FetchResult{}, nil
+func (c cmdFakeConnector) Fetch(context.Context, core.FetchRequest) (core.FetchResult, error) {
+	return core.FetchResult{Payload: c.payload, StatusCode: 200}, nil
 }
 
 type cmdFakeTarget struct {
-	exportSQL   []byte
-	applyResult core.ApplyResult
-	applyErr    error
+	exportSQL         []byte
+	exportFullSyncSQL []byte
+	applyResult       core.ApplyResult
+	applyFullSync     core.ApplyResult
+	applyErr          error
+	applyFullSyncErr  error
 }
 
 func (t *cmdFakeTarget) Apply(context.Context, *core.MigrationPlan) (core.ApplyResult, error) {
 	return t.applyResult, t.applyErr
 }
 
+func (t *cmdFakeTarget) ApplyFullSync(context.Context, *core.FullSyncPlan) (core.ApplyResult, error) {
+	return t.applyFullSync, t.applyFullSyncErr
+}
+
 func (t *cmdFakeTarget) ExportSQL(*core.MigrationPlan) ([]byte, error) {
 	return t.exportSQL, nil
 }
 
-func (t *cmdFakeTarget) Capabilities() core.Capabilities {
-	return core.Capabilities{CanExportSQL: true}
+func (t *cmdFakeTarget) ExportFullSyncSQL(*core.FullSyncPlan) ([]byte, error) {
+	return t.exportFullSyncSQL, nil
 }
 
-func TestRunHappyPath(t *testing.T) {
-	specPath := writeCmdSpec(t)
-	sqlPath := filepath.Join(t.TempDir(), "res.sql")
-	apiName := "test_api_happy"
-	dbName := "test_db_happy"
+func (t *cmdFakeTarget) Capabilities() core.Capabilities {
+	return core.Capabilities{CanExportSQL: true, CanFullSync: true}
+}
+
+type cmdNoFullSyncTarget struct{}
+
+func (cmdNoFullSyncTarget) Apply(context.Context, *core.MigrationPlan) (core.ApplyResult, error) {
+	return core.ApplyResult{}, nil
+}
+
+func (cmdNoFullSyncTarget) ApplyFullSync(context.Context, *core.FullSyncPlan) (core.ApplyResult, error) {
+	return core.ApplyResult{}, nil
+}
+
+func (cmdNoFullSyncTarget) ExportSQL(*core.MigrationPlan) ([]byte, error) {
+	return nil, nil
+}
+
+func (cmdNoFullSyncTarget) ExportFullSyncSQL(*core.FullSyncPlan) ([]byte, error) {
+	return nil, nil
+}
+
+func (cmdNoFullSyncTarget) Capabilities() core.Capabilities {
+	return core.Capabilities{CanExportSQL: true, CanFullSync: false}
+}
+
+func TestRunOneShotHappyPath(t *testing.T) {
+	restore := stubMainDeps(t)
+	defer restore()
+
+	specPath := writeCmdSpec(t, true)
+	configPath := writeCmdConfig(t, specPath, 0, "postgres")
 	target := &cmdFakeTarget{
 		exportSQL:   []byte("SELECT 1;"),
 		applyResult: core.ApplyResult{AppliedCount: 3},
 	}
-
-	api.Register(apiName, func(cfg config.APIConfig, logger observability.RequestLogger) (core.APIConnector, error) {
-		if cfg.BaseURL != "https://api.example.com" {
-			t.Fatalf("unexpected api config: %+v", cfg)
-		}
-		if logger == nil {
-			t.Fatal("expected logger")
-		}
-		return cmdFakeConnector{}, nil
-	})
-	db.Register(dbName, func(cfg config.DatabaseConfig) (core.MigrationTarget, error) {
-		if cfg.ConnectionString != "memory://db" {
-			t.Fatalf("unexpected db config: %+v", cfg)
-		}
+	newAPIConnector = func(string, config.APIConfig, observability.RequestLogger) (core.APIConnector, error) {
+		return cmdFakeConnector{payload: []byte(`[{"id":1}]`)}, nil
+	}
+	newDBTarget = func(string, config.DatabaseConfig) (core.MigrationTarget, error) {
 		return target, nil
-	})
+	}
 
-	configPath := writeCmdConfig(t, specPath, sqlPath, apiName, dbName)
 	var out bytes.Buffer
-
 	if err := run(context.Background(), configPath, &out); err != nil {
 		t.Fatalf("run returned error: %v", err)
 	}
@@ -79,33 +102,32 @@ func TestRunHappyPath(t *testing.T) {
 		t.Fatalf("expected base URL in output, got %s", output)
 	}
 	if !strings.Contains(output, "Applied 3 migrations") {
-		t.Fatalf("expected apply output, got %s", output)
+		t.Fatalf("unexpected output: %s", output)
 	}
 	if !strings.Contains(output, "SELECT 1;") {
-		t.Fatalf("expected exported SQL in output, got %s", output)
+		t.Fatalf("expected exported SQL, got %s", output)
 	}
 }
 
 func TestRunWritesSQLWhenApplyFails(t *testing.T) {
-	specPath := writeCmdSpec(t)
+	restore := stubMainDeps(t)
+	defer restore()
+
+	specPath := writeCmdSpec(t, true)
 	sqlPath := filepath.Join(t.TempDir(), "fallback.sql")
-	apiName := "test_api_fallback"
-	dbName := "test_db_fallback"
+	configPath := writeCmdConfigWithSQLPath(t, specPath, 0, "postgres", sqlPath)
 	target := &cmdFakeTarget{
 		exportSQL: []byte("INSERT INTO events VALUES (1);"),
 		applyErr:  errors.New("db unavailable"),
 	}
-
-	api.Register(apiName, func(config.APIConfig, observability.RequestLogger) (core.APIConnector, error) {
-		return cmdFakeConnector{}, nil
-	})
-	db.Register(dbName, func(config.DatabaseConfig) (core.MigrationTarget, error) {
+	newAPIConnector = func(string, config.APIConfig, observability.RequestLogger) (core.APIConnector, error) {
+		return cmdFakeConnector{payload: []byte(`[{"id":1}]`)}, nil
+	}
+	newDBTarget = func(string, config.DatabaseConfig) (core.MigrationTarget, error) {
 		return target, nil
-	})
+	}
 
-	configPath := writeCmdConfig(t, specPath, sqlPath, apiName, dbName)
 	var out bytes.Buffer
-
 	if err := run(context.Background(), configPath, &out); err != nil {
 		t.Fatalf("run returned error: %v", err)
 	}
@@ -123,39 +145,149 @@ func TestRunWritesSQLWhenApplyFails(t *testing.T) {
 }
 
 func TestRunReturnsProviderSelectionError(t *testing.T) {
-	specPath := writeCmdSpec(t)
-	configPath := writeCmdConfig(t, specPath, filepath.Join(t.TempDir(), "res.sql"), "missing_api", "postgres")
-	var out bytes.Buffer
+	restore := stubMainDeps(t)
+	defer restore()
 
-	err := run(context.Background(), configPath, &out)
+	specPath := writeCmdSpec(t, true)
+	configPath := writeCmdConfig(t, specPath, 0, "postgres")
+	newAPIConnector = func(string, config.APIConfig, observability.RequestLogger) (core.APIConnector, error) {
+		return nil, fmt.Errorf(`unknown api provider "missing_api"`)
+	}
+
+	err := run(context.Background(), configPath, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), `build api provider: unknown api provider "missing_api"`) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
-func writeCmdSpec(t *testing.T) string {
+func TestRunPeriodicFullReloadLoopsUntilCanceled(t *testing.T) {
+	restore := stubMainDeps(t)
+	defer restore()
+
+	specPath := writeCmdSpec(t, true)
+	configPath := writeCmdConfig(t, specPath, 5, "postgres")
+	target := &cmdFakeTarget{
+		exportFullSyncSQL: []byte("DELETE FROM items;"),
+		applyFullSync:     core.ApplyResult{AppliedCount: 4},
+	}
+	newAPIConnector = func(string, config.APIConfig, observability.RequestLogger) (core.APIConnector, error) {
+		return cmdFakeConnector{payload: []byte(`[{"id":1}]`)}, nil
+	}
+	newDBTarget = func(string, config.DatabaseConfig) (core.MigrationTarget, error) {
+		return target, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sleepWithContext = func(context.Context, time.Duration) error {
+		cancel()
+		return context.Canceled
+	}
+
+	var out bytes.Buffer
+	if err := run(ctx, configPath, &out); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+	if !strings.Contains(out.String(), "Full reload cycle 1 applied 4 statements") {
+		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestRunRejectsPeriodicReloadWhenProviderLacksFullSync(t *testing.T) {
+	restore := stubMainDeps(t)
+	defer restore()
+
+	specPath := writeCmdSpec(t, true)
+	configPath := writeCmdConfig(t, specPath, 5, "sqlite")
+	newAPIConnector = func(string, config.APIConfig, observability.RequestLogger) (core.APIConnector, error) {
+		return cmdFakeConnector{payload: []byte(`[{"id":1}]`)}, nil
+	}
+	newDBTarget = func(string, config.DatabaseConfig) (core.MigrationTarget, error) {
+		return cmdNoFullSyncTarget{}, nil
+	}
+
+	err := run(context.Background(), configPath, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "does not support periodic full reload") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func stubMainDeps(t *testing.T) func() {
+	t.Helper()
+
+	oldLoadConfig := loadConfig
+	oldNewRequestLogger := newRequestLogger
+	oldNewAPIConnector := newAPIConnector
+	oldNewDBTarget := newDBTarget
+	oldLoadOpenAPI := loadOpenAPI
+	oldWriteFile := writeFile
+	oldSleepWithContext := sleepWithContext
+
+	return func() {
+		loadConfig = oldLoadConfig
+		newRequestLogger = oldNewRequestLogger
+		newAPIConnector = oldNewAPIConnector
+		newDBTarget = oldNewDBTarget
+		loadOpenAPI = oldLoadOpenAPI
+		writeFile = oldWriteFile
+		sleepWithContext = oldSleepWithContext
+	}
+}
+
+func writeCmdSpec(t *testing.T, withFetchablePath bool) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "spec.json")
 	spec := `{
   "openapi": "3.0.3",
   "info": {"title": "test", "version": "1.0.0"},
-  "paths": {}
+  "paths": {
+    "/items": {
+      "get": {
+        "x-res-type": "one-shot",
+        "responses": {
+          "200": {
+            "description": "ok",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {"type": "integer", "x-pk": true}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }`
+	if !withFetchablePath {
+		spec = `{"openapi":"3.0.3","info":{"title":"test","version":"1.0.0"},"paths":{}}`
+	}
 	if err := os.WriteFile(path, []byte(spec), 0644); err != nil {
 		t.Fatalf("write spec: %v", err)
 	}
 	return path
 }
 
-func writeCmdConfig(t *testing.T, specPath, sqlPath, apiProvider, dbProvider string) string {
+func writeCmdConfig(t *testing.T, specPath string, fullReloadInterval int, dbProvider string) string {
+	t.Helper()
+	return writeCmdConfigWithSQLPath(t, specPath, fullReloadInterval, dbProvider, filepath.Join(t.TempDir(), "res.sql"))
+}
+
+func writeCmdConfigWithSQLPath(t *testing.T, specPath string, fullReloadInterval int, dbProvider, sqlPath string) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "conf.yaml")
 	body := fmt.Sprintf(`
 openapi_path: %q
 api:
-  provider: %q
+  provider: "test_api"
   base_url: "https://api.example.com"
 database:
   provider: %q
@@ -163,7 +295,8 @@ database:
 runtime:
   sql_output_path: %q
   run_log_path: %q
-`, specPath, apiProvider, dbProvider, sqlPath, filepath.Join(t.TempDir(), "run.log"))
+  full_reload_interval_seconds: %d
+`, specPath, dbProvider, sqlPath, filepath.Join(t.TempDir(), "run.log"), fullReloadInterval)
 	if err := os.WriteFile(path, []byte(strings.TrimSpace(body)), 0644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}

@@ -16,9 +16,17 @@ func (stubTarget) Apply(context.Context, *core.MigrationPlan) (core.ApplyResult,
 	return core.ApplyResult{}, nil
 }
 
+func (stubTarget) ApplyFullSync(context.Context, *core.FullSyncPlan) (core.ApplyResult, error) {
+	return core.ApplyResult{}, nil
+}
+
 func (stubTarget) ExportSQL(*core.MigrationPlan) ([]byte, error) { return nil, nil }
 
-func (stubTarget) Capabilities() core.Capabilities { return core.Capabilities{CanExportSQL: true} }
+func (stubTarget) ExportFullSyncSQL(*core.FullSyncPlan) ([]byte, error) { return nil, nil }
+
+func (stubTarget) Capabilities() core.Capabilities {
+	return core.Capabilities{CanExportSQL: true}
+}
 
 func TestNewReturnsRegisteredProvider(t *testing.T) {
 	name := fmt.Sprintf("test-provider-%s", strings.ToLower(t.Name()))

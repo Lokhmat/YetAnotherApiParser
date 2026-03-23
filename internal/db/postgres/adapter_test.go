@@ -61,11 +61,11 @@ func TestExportSQL(t *testing.T) {
 	}
 	sqlText := string(sqlBytes)
 	for _, needle := range []string{
-		"CREATE TABLE users",
+		"CREATE TABLE IF NOT EXISTS users",
 		"id INTEGER PRIMARY KEY",
 		"name TEXT NOT NULL",
 		"phones INTEGER[]",
-		"CREATE TABLE orders_tags_link",
+		"CREATE TABLE IF NOT EXISTS orders_tags_link",
 		"PRIMARY KEY (orders_oid, tags_tid)",
 		"INSERT INTO users (id, name, phones) VALUES (1, E'alice', ARRAY[10, 11]::INTEGER[]) ON CONFLICT (id) DO NOTHING;",
 		"INSERT INTO users (id, name) VALUES (2, E'line1\\nline2') ON CONFLICT (id) DO NOTHING;",
@@ -76,5 +76,66 @@ func TestExportSQL(t *testing.T) {
 	}
 	if strings.Contains(sqlText, "duplicate") {
 		t.Fatalf("expected duplicate PK row to be omitted from exported SQL\nactual:\n%s", sqlText)
+	}
+}
+
+func TestExportFullSyncSQL(t *testing.T) {
+	plan := &core.FullSyncPlan{
+		Tables: []core.FullSyncTable{
+			{
+				Name: "users",
+				Columns: []core.Column{
+					{Name: "id", Type: "INTEGER", PrimaryKey: true},
+					{Name: "name", Type: "TEXT", Nullable: true},
+				},
+				PrimaryKey: []string{"id"},
+				Rows: []core.InsertRow{
+					{
+						Columns: []string{"id", "name"},
+						Values:  []core.Value{{Scalar: 1}, {Scalar: "alice"}},
+					},
+					{
+						Columns: []string{"id", "name"},
+						Values:  []core.Value{{Scalar: 2}, {Scalar: nil}},
+					},
+				},
+			},
+		},
+	}
+
+	sqlBytes, err := (&adapter{}).ExportFullSyncSQL(plan)
+	if err != nil {
+		t.Fatalf("ExportFullSyncSQL returned error: %v", err)
+	}
+	sqlText := string(sqlBytes)
+	for _, needle := range []string{
+		"CREATE TABLE IF NOT EXISTS users",
+		"INSERT INTO users (id, name) VALUES (1, E'alice') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;",
+		"INSERT INTO users (id, name) VALUES (2, NULL) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;",
+		"DELETE FROM users WHERE NOT ((id = 1) OR (id = 2));",
+	} {
+		if !strings.Contains(sqlText, needle) {
+			t.Fatalf("expected SQL to contain %q\nactual:\n%s", needle, sqlText)
+		}
+	}
+}
+
+func TestExportFullSyncSQLDeletesAllWhenSnapshotEmpty(t *testing.T) {
+	plan := &core.FullSyncPlan{
+		Tables: []core.FullSyncTable{
+			{
+				Name:       "users",
+				Columns:    []core.Column{{Name: "id", Type: "INTEGER", PrimaryKey: true}},
+				PrimaryKey: []string{"id"},
+			},
+		},
+	}
+
+	sqlBytes, err := (&adapter{}).ExportFullSyncSQL(plan)
+	if err != nil {
+		t.Fatalf("ExportFullSyncSQL returned error: %v", err)
+	}
+	if !strings.Contains(string(sqlBytes), "DELETE FROM users;") {
+		t.Fatalf("expected delete-all statement, got:\n%s", sqlBytes)
 	}
 }

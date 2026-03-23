@@ -645,6 +645,83 @@ func TestGeneratePlanOffsetPaginationPerDependencyCombination(t *testing.T) {
 	}
 }
 
+func TestGenerateFullSyncPlanBuildsDesiredRows(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/marked": func(req FetchRequest) ([]byte, error) {
+				return []byte(`{
+					"usersPayload": {
+						"id": 1,
+						"name": "alice",
+						"settings": {"sid": 10, "name": "dark"},
+						"phones": [{"pid": 100, "value": "123"}]
+					},
+					"ordersPayload": [{
+						"oid": 7,
+						"customer": {"cid": 8, "title": "bob"},
+						"tags": [{"tid": 9, "label": "hot"}]
+					}]
+				}`), nil
+			},
+		},
+	}
+
+	service := NewService(api)
+	plan, err := service.GenerateFullSyncPlan(context.Background(), markedSpec(), "https://example.com")
+	if err != nil {
+		t.Fatalf("GenerateFullSyncPlan returned error: %v", err)
+	}
+
+	users := fullSyncTableByName(t, plan, "users")
+	if len(users.PrimaryKey) != 1 || users.PrimaryKey[0] != "id" {
+		t.Fatalf("unexpected users primary key: %+v", users.PrimaryKey)
+	}
+	if len(users.Rows) != 1 {
+		t.Fatalf("expected 1 user row, got %d", len(users.Rows))
+	}
+	if users.Rows[0].Columns[0] != "id" || users.Rows[0].Columns[1] != "name" {
+		t.Fatalf("expected normalized column order, got %+v", users.Rows[0].Columns)
+	}
+
+	link := fullSyncTableByName(t, plan, "orders_tags_link")
+	if len(link.Rows) != 1 {
+		t.Fatalf("expected 1 link row, got %d", len(link.Rows))
+	}
+}
+
+func TestGenerateFullSyncPlanFailsWithoutPrimaryKey(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/items": func(req FetchRequest) ([]byte, error) {
+				return []byte(`[{"name":"x"}]`), nil
+			},
+		},
+	}
+
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/items", &openapi3.PathItem{
+				Get: &openapi3.Operation{
+					Extensions: map[string]any{"x-res-type": "one-shot"},
+					Responses: responseWithJSONSchema("#/components/schemas/items",
+						openapi3.NewArraySchema().WithItems(
+							openapi3.NewObjectSchema().WithProperty("name", openapi3.NewStringSchema()),
+						),
+					),
+				},
+			}),
+		),
+	}
+
+	service := NewService(api)
+	_, err := service.GenerateFullSyncPlan(context.Background(), spec, "https://example.com")
+	if err == nil || !strings.Contains(err.Error(), "primary key metadata") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func buildThreeStepSpec() *openapi3.T {
 	id1Field := openapi3.NewIntegerSchema()
 	id1Field.Extensions = map[string]any{"x-response-data": map[string]any{"id": "id1"}}
@@ -760,4 +837,16 @@ func withPK(schema *openapi3.Schema) *openapi3.Schema {
 	}
 	schema.Extensions["x-pk"] = true
 	return schema
+}
+
+func fullSyncTableByName(t *testing.T, plan *FullSyncPlan, tableName string) FullSyncTable {
+	t.Helper()
+
+	for _, table := range plan.Tables {
+		if table.Name == tableName {
+			return table
+		}
+	}
+	t.Fatalf("table %s not found", tableName)
+	return FullSyncTable{}
 }

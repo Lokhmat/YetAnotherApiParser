@@ -25,12 +25,15 @@ type APIConnector interface {
 
 type MigrationTarget interface {
 	Apply(ctx context.Context, plan *MigrationPlan) (ApplyResult, error)
+	ApplyFullSync(ctx context.Context, plan *FullSyncPlan) (ApplyResult, error)
 	ExportSQL(plan *MigrationPlan) ([]byte, error)
+	ExportFullSyncSQL(plan *FullSyncPlan) ([]byte, error)
 	Capabilities() Capabilities
 }
 
 type Capabilities struct {
 	CanExportSQL bool
+	CanFullSync  bool
 }
 
 type ApplyResult struct {
@@ -58,6 +61,17 @@ func (p *MigrationPlan) Add(op MigrationOperation) {
 		return
 	}
 	p.Operations = append(p.Operations, op)
+}
+
+type FullSyncPlan struct {
+	Tables []FullSyncTable
+}
+
+type FullSyncTable struct {
+	Name       string
+	Columns    []Column
+	PrimaryKey []string
+	Rows       []InsertRow
 }
 
 type Column struct {

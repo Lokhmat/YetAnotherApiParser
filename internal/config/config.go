@@ -33,6 +33,10 @@ type DatabaseConfig struct {
 type RuntimeConfig struct {
 	SQLOutputPath string `yaml:"sql_output_path"`
 	RunLogPath    string `yaml:"run_log_path"`
+
+	FullReloadInterval        time.Duration `yaml:"-"`
+	FullReloadEnabled         bool          `yaml:"-"`
+	FullReloadIntervalSeconds int           `yaml:"full_reload_interval_seconds"`
 }
 
 type Config struct {
@@ -84,4 +88,9 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Runtime.RunLogPath) == "" {
 		c.Runtime.RunLogPath = "runlog.log"
 	}
+	if c.Runtime.FullReloadIntervalSeconds < 0 {
+		c.Runtime.FullReloadIntervalSeconds = 0
+	}
+	c.Runtime.FullReloadEnabled = c.Runtime.FullReloadIntervalSeconds > 0
+	c.Runtime.FullReloadInterval = time.Duration(c.Runtime.FullReloadIntervalSeconds) * time.Second
 }

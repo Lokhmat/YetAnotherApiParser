@@ -24,7 +24,7 @@ func init() {
 }
 
 func (a *adapter) Capabilities() core.Capabilities {
-	return core.Capabilities{CanExportSQL: true}
+	return core.Capabilities{CanExportSQL: true, CanFullSync: true}
 }
 
 func (a *adapter) ExportSQL(plan *core.MigrationPlan) ([]byte, error) {
@@ -65,6 +65,39 @@ func (a *adapter) Apply(ctx context.Context, plan *core.MigrationPlan) (core.App
 	if err != nil {
 		return core.ApplyResult{}, err
 	}
+	return a.applySQL(ctx, sqlBytes, "migration")
+}
+
+func (a *adapter) ExportFullSyncSQL(plan *core.FullSyncPlan) ([]byte, error) {
+	if plan == nil {
+		return nil, nil
+	}
+
+	lines := make([]string, 0)
+	for _, table := range plan.Tables {
+		lines = append(lines, renderFullSyncCreateTable(table))
+	}
+	for i := len(plan.Tables) - 1; i >= 0; i-- {
+		lines = append(lines, renderFullSyncTruncate(plan.Tables[i]))
+	}
+	for _, table := range plan.Tables {
+		lines = append(lines, renderFullSyncInserts(table)...)
+	}
+	if len(lines) == 0 {
+		return nil, nil
+	}
+	return []byte(strings.Join(lines, "\n\n")), nil
+}
+
+func (a *adapter) ApplyFullSync(ctx context.Context, plan *core.FullSyncPlan) (core.ApplyResult, error) {
+	sqlBytes, err := a.ExportFullSyncSQL(plan)
+	if err != nil {
+		return core.ApplyResult{}, err
+	}
+	return a.applySQL(ctx, sqlBytes, "full sync")
+}
+
+func (a *adapter) applySQL(ctx context.Context, sqlBytes []byte, label string) (core.ApplyResult, error) {
 	if len(sqlBytes) == 0 {
 		return core.ApplyResult{}, nil
 	}
@@ -85,7 +118,7 @@ func (a *adapter) Apply(ctx context.Context, plan *core.MigrationPlan) (core.App
 			continue
 		}
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
-			return core.ApplyResult{AppliedCount: applied}, fmt.Errorf("exec migration: %w", err)
+			return core.ApplyResult{AppliedCount: applied}, fmt.Errorf("exec %s: %w", label, err)
 		}
 		applied++
 	}
@@ -310,4 +343,32 @@ func splitStatements(sqlText string) []string {
 		stmts = append(stmts, stmt)
 	}
 	return stmts
+}
+
+func renderFullSyncCreateTable(table core.FullSyncTable) string {
+	return renderCreateTable(core.CreateTableOp{
+		TableName: table.Name,
+		Columns:   table.Columns,
+	})
+}
+
+func renderFullSyncTruncate(table core.FullSyncTable) string {
+	return fmt.Sprintf("TRUNCATE TABLE %s;", table.Name)
+}
+
+func renderFullSyncInserts(table core.FullSyncTable) []string {
+	lines := make([]string, 0, len(table.Rows))
+	for _, row := range table.Rows {
+		values := make([]string, 0, len(row.Values))
+		for _, value := range row.Values {
+			values = append(values, toSQLLiteral(value))
+		}
+		lines = append(lines, fmt.Sprintf(
+			"INSERT INTO %s (%s) VALUES (%s);",
+			table.Name,
+			strings.Join(row.Columns, ", "),
+			strings.Join(values, ", "),
+		))
+	}
+	return lines
 }

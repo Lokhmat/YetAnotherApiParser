@@ -25,6 +25,7 @@ database:
 runtime:
   sql_output_path: out.sql
   run_log_path: requests.log
+  full_reload_interval_seconds: 45
 `)
 
 	cfg, err := Load(path)
@@ -49,6 +50,9 @@ runtime:
 	}
 	if cfg.Runtime.SQLOutputPath != "out.sql" || cfg.Runtime.RunLogPath != "requests.log" {
 		t.Fatalf("unexpected runtime config: %+v", cfg.Runtime)
+	}
+	if !cfg.Runtime.FullReloadEnabled || cfg.Runtime.FullReloadInterval != 45*time.Second {
+		t.Fatalf("unexpected full reload config: %+v", cfg.Runtime)
 	}
 }
 
@@ -92,6 +96,12 @@ runtime: {}
 	}
 	if cfg.Runtime.SQLOutputPath != "res.sql" || cfg.Runtime.RunLogPath != "runlog.log" {
 		t.Fatalf("unexpected runtime defaults: %+v", cfg.Runtime)
+	}
+	if cfg.Runtime.FullReloadEnabled {
+		t.Fatalf("expected full reload to be disabled by default")
+	}
+	if cfg.Runtime.FullReloadInterval != 0 {
+		t.Fatalf("expected zero full reload interval, got %v", cfg.Runtime.FullReloadInterval)
 	}
 }
 

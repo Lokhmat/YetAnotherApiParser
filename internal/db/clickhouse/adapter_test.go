@@ -85,6 +85,42 @@ func TestExportSQL(t *testing.T) {
 	}
 }
 
+func TestExportFullSyncSQL(t *testing.T) {
+	plan := &core.FullSyncPlan{
+		Tables: []core.FullSyncTable{
+			{
+				Name: "users",
+				Columns: []core.Column{
+					{Name: "id", Type: "INTEGER", PrimaryKey: true},
+					{Name: "name", Type: "TEXT", Nullable: true},
+				},
+				PrimaryKey: []string{"id"},
+				Rows: []core.InsertRow{
+					{
+						Columns: []string{"id", "name"},
+						Values:  []core.Value{{Scalar: 1}, {Scalar: "alice"}},
+					},
+				},
+			},
+		},
+	}
+
+	sqlBytes, err := (&adapter{}).ExportFullSyncSQL(plan)
+	if err != nil {
+		t.Fatalf("ExportFullSyncSQL returned error: %v", err)
+	}
+	sqlText := string(sqlBytes)
+	for _, needle := range []string{
+		"CREATE TABLE IF NOT EXISTS users",
+		"TRUNCATE TABLE users;",
+		"INSERT INTO users (id, name) VALUES (1, 'alice');",
+	} {
+		if !strings.Contains(sqlText, needle) {
+			t.Fatalf("expected SQL to contain %q\nactual:\n%s", needle, sqlText)
+		}
+	}
+}
+
 func TestRenderCreateTableWithoutPrimaryKeyUsesTupleOrderBy(t *testing.T) {
 	sqlText := renderCreateTable(core.CreateTableOp{
 		TableName: "events",

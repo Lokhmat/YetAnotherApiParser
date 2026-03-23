@@ -10,4 +10,7 @@ api:
 
 database:
   provider: clickhouse
-  connection_string: host=localhost user=postgres password=postgres dbname=postgres port=5440
+  connection_string: host=localhost user=postgres password=postgres dbname=postgres port=5440 sslmode=disable
+
+runtime:
+  full_reload_interval_seconds: 10

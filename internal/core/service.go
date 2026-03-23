@@ -140,6 +140,11 @@ type operationExtractionPlan struct {
 	Relations      []*relationPlan
 }
 
+type tableState struct {
+	table *FullSyncTable
+	rows  map[string]InsertRow
+}
+
 var sqlIdentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL string) (*MigrationPlan, error) {
@@ -279,6 +284,178 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 	}
 
 	return plan, nil
+}
+
+func (s *Service) GenerateFullSyncPlan(ctx context.Context, spec *openapi3.T, baseURL string) (*FullSyncPlan, error) {
+	plan, err := s.GeneratePlan(ctx, spec, baseURL)
+	if err != nil {
+		return nil, err
+	}
+	return buildFullSyncPlan(plan)
+}
+
+func buildFullSyncPlan(plan *MigrationPlan) (*FullSyncPlan, error) {
+	if plan == nil {
+		return &FullSyncPlan{}, nil
+	}
+
+	states := make(map[string]*tableState)
+	order := make([]string, 0)
+
+	ensureTable := func(name string) *tableState {
+		state := states[name]
+		if state != nil {
+			return state
+		}
+		table := &FullSyncTable{Name: name}
+		state = &tableState{
+			table: table,
+			rows:  make(map[string]InsertRow),
+		}
+		states[name] = state
+		order = append(order, name)
+		return state
+	}
+
+	for _, op := range plan.Operations {
+		switch typed := op.(type) {
+		case CreateTableOp:
+			state := ensureTable(typed.TableName)
+			state.table.Columns = append([]Column{}, typed.Columns...)
+			state.table.PrimaryKey = primaryKeyColumnsFromColumns(typed.Columns)
+		case *CreateTableOp:
+			state := ensureTable(typed.TableName)
+			state.table.Columns = append([]Column{}, typed.Columns...)
+			state.table.PrimaryKey = primaryKeyColumnsFromColumns(typed.Columns)
+		case CreateLinkTableOp:
+			state := ensureTable(typed.TableName)
+			state.table.Columns = []Column{
+				{Name: typed.LeftColumn, Type: typed.LeftType, Nullable: false, PrimaryKey: true},
+				{Name: typed.RightColumn, Type: typed.RightType, Nullable: false, PrimaryKey: true},
+			}
+			if len(typed.PrimaryKey) > 0 {
+				state.table.PrimaryKey = append([]string{}, typed.PrimaryKey...)
+			} else {
+				state.table.PrimaryKey = []string{typed.LeftColumn, typed.RightColumn}
+			}
+		case *CreateLinkTableOp:
+			state := ensureTable(typed.TableName)
+			state.table.Columns = []Column{
+				{Name: typed.LeftColumn, Type: typed.LeftType, Nullable: false, PrimaryKey: true},
+				{Name: typed.RightColumn, Type: typed.RightType, Nullable: false, PrimaryKey: true},
+			}
+			if len(typed.PrimaryKey) > 0 {
+				state.table.PrimaryKey = append([]string{}, typed.PrimaryKey...)
+			} else {
+				state.table.PrimaryKey = []string{typed.LeftColumn, typed.RightColumn}
+			}
+		case InsertRowsOp:
+			if err := addFullSyncRows(ensureTable(typed.TableName), typed); err != nil {
+				return nil, err
+			}
+		case *InsertRowsOp:
+			if err := addFullSyncRows(ensureTable(typed.TableName), *typed); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	result := &FullSyncPlan{Tables: make([]FullSyncTable, 0, len(order))}
+	for _, name := range order {
+		state := states[name]
+		if len(state.table.PrimaryKey) == 0 {
+			return nil, fmt.Errorf("full reload requires primary key metadata for table %s", name)
+		}
+		keys := make([]string, 0, len(state.rows))
+		for key := range state.rows {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		rows := make([]InsertRow, 0, len(keys))
+		for _, key := range keys {
+			rows = append(rows, state.rows[key])
+		}
+		state.table.Rows = rows
+		result.Tables = append(result.Tables, *state.table)
+	}
+
+	return result, nil
+}
+
+func addFullSyncRows(state *tableState, op InsertRowsOp) error {
+	if state == nil {
+		return nil
+	}
+	if len(state.table.PrimaryKey) == 0 {
+		return fmt.Errorf("full reload requires primary key metadata for table %s", op.TableName)
+	}
+	for _, row := range op.Rows {
+		key, err := buildFullSyncRowKey(op.TableName, row, state.table.PrimaryKey)
+		if err != nil {
+			return err
+		}
+		state.rows[key] = normalizeFullSyncRow(row, state.table.Columns)
+	}
+	return nil
+}
+
+func primaryKeyColumnsFromColumns(columns []Column) []string {
+	result := make([]string, 0)
+	for _, col := range columns {
+		if col.PrimaryKey {
+			result = append(result, col.Name)
+		}
+	}
+	return result
+}
+
+func buildFullSyncRowKey(tableName string, row InsertRow, pkColumns []string) (string, error) {
+	parts := make([]string, 0, len(pkColumns)+1)
+	parts = append(parts, tableName)
+	for _, pkCol := range pkColumns {
+		index := -1
+		for i, col := range row.Columns {
+			if col == pkCol {
+				index = i
+				break
+			}
+		}
+		if index == -1 || index >= len(row.Values) {
+			return "", fmt.Errorf("full reload row for table %s is missing primary key column %s", tableName, pkCol)
+		}
+		parts = append(parts, pkCol+"="+fullSyncValueKey(row.Values[index]))
+	}
+	return strings.Join(parts, "|"), nil
+}
+
+func fullSyncValueKey(v Value) string {
+	if v.ArrayElementType != "" {
+		return fmt.Sprintf("%v|%s", v.Array, v.ArrayElementType)
+	}
+	return fmt.Sprintf("%v", v.Scalar)
+}
+
+func normalizeFullSyncRow(row InsertRow, columns []Column) InsertRow {
+	valueByColumn := make(map[string]Value, len(row.Columns))
+	for i, col := range row.Columns {
+		if i < len(row.Values) {
+			valueByColumn[col] = row.Values[i]
+		}
+	}
+
+	normalized := InsertRow{
+		Columns: make([]string, 0, len(columns)),
+		Values:  make([]Value, 0, len(columns)),
+	}
+	for _, col := range columns {
+		normalized.Columns = append(normalized.Columns, col.Name)
+		if value, ok := valueByColumn[col.Name]; ok {
+			normalized.Values = append(normalized.Values, value)
+			continue
+		}
+		normalized.Values = append(normalized.Values, Value{Scalar: nil})
+	}
+	return normalized
 }
 
 func buildCreateTableOpFromSchema(schemaRef *openapi3.SchemaRef, tableName string) (CreateTableOp, error) {

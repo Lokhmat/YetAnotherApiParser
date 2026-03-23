@@ -20,6 +20,7 @@ It can:
 - flatten marked nested response objects into separate tables (`x-table-name`)
 - export SQL through the DB adapter
 - apply migrations directly to DB
+- periodically refetch the full API snapshot and reconcile managed DB tables
 - write request run logs to a configurable path
 
 ## Requirements
@@ -37,6 +38,7 @@ openapi_path: "example/api.json"
 runtime:
   sql_output_path: "res.sql"
   run_log_path: "runlog.log"
+  full_reload_interval_seconds: 0
 
 api:
   provider: "openapi_http"
@@ -61,13 +63,13 @@ database:
 ```
 
 Use the official `clickhouse-go` `database/sql` DSN format for `database.connection_string`.
-
 Compatibility notes:
 
 - `api.provider` defaults to `openapi_http`
 - `database.provider` defaults to `postgres`
 - `runtime.sql_output_path` defaults to `res.sql`
 - `runtime.run_log_path` defaults to `runlog.log`
+- `runtime.full_reload_interval_seconds` defaults to `0` (disabled)
 - old config files without `provider` or `runtime` sections still work
 
 ClickHouse adapter notes:
@@ -92,6 +94,22 @@ Behavior:
 5. Try applying the migration plan to DB.
 6. If DB apply fails, write exported SQL to `runtime.sql_output_path`.
 
+If `runtime.full_reload_interval_seconds > 0`:
+
+1. The parser still performs a full fetch of all fetchable operations.
+2. It converts the fetched snapshot into desired table contents keyed by primary key.
+3. It keeps running and repeats the full fetch every configured interval.
+4. Each cycle reconciles parser-managed tables with the latest API snapshot.
+5. If a cycle fails, the cycle SQL snapshot is written to `runtime.sql_output_path` and the process keeps polling.
+
+Periodic full reload notes:
+
+- enabled globally from config, not per operation
+- every managed table must have PK metadata (`x-pk` or generated link-table PK), otherwise startup fails
+- synchronization scope is limited to parser-managed tables from the loaded spec
+- `postgres` uses row-level upsert/delete reconciliation inside one DB transaction
+- `clickhouse` uses full-table refresh per managed table (`TRUNCATE` + reinsert), so convergence is eventual but not transactional across the whole cycle
+
 ## Architecture Overview
 
 The project is now split into four main modules:
@@ -99,7 +117,7 @@ The project is now split into four main modules:
 - `internal/config`: typed config loading, defaults, runtime paths, provider selection
 - `internal/api`: API connector registry and networking implementations
 - `internal/core`: fetch planning, FK resolution, extraction, and migration-plan building
-- `internal/db`: DB target registry and provider-specific execution/SQL export
+- `internal/db`: DB target registry and provider-specific execution/SQL export/full-sync reconciliation
 
 Connectors are compiled into the binary and selected by config.
 
@@ -203,6 +221,8 @@ Used in both:
 - classic top-level table mode
 - `x-table-name` marked mode
 
+When periodic full reload is enabled, every managed table must have a primary key so rows can be updated and deleted during reconciliation.
+
 ### `x-table-name` (response object schema)
 
 Marks nested object/array item object that should be extracted as a separate table.
@@ -275,6 +295,7 @@ Example line:
 ## Outputs
 
 - SQL export file at `runtime.sql_output_path` when DB apply fails
+- SQL export file at `runtime.sql_output_path` when a periodic full-reload cycle fails
 - DB migrations applied directly when DB execution succeeds
 - request trace log at `runtime.run_log_path`
 

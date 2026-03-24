@@ -26,6 +26,17 @@ type NopRequestLogger struct{}
 
 func (NopRequestLogger) LogRequest(RequestEvent) {}
 
+type MultiRequestLogger []RequestLogger
+
+func (l MultiRequestLogger) LogRequest(event RequestEvent) {
+	for _, logger := range l {
+		if logger == nil {
+			continue
+		}
+		logger.LogRequest(event)
+	}
+}
+
 type FileRequestLogger struct {
 	path string
 	mu   sync.Mutex

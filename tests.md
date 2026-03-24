@@ -10,16 +10,19 @@ GOCACHE=$(pwd)/.gocache go test ./...
 
 ## Coverage Map
 
-- `cmd`: startup wiring, one-shot execution, periodic full-reload loop, provider capability gating
-- `internal/config`: YAML parsing, defaults, duration conversion, retry normalization, config load failures, periodic reload settings
+- `cmd`: startup wiring, one-shot execution, periodic full-reload loop, provider capability gating, control-server startup wiring
+- `cmd/apictl`: Docker build/run command assembly, control API client rendering for status/runs/logs
+- `internal/config`: YAML parsing, defaults, duration conversion, retry normalization, config load failures, periodic reload settings, control config defaults, env expansion
+- `internal/control`: HTTP handlers for health, status, recent runs, and request/event log tails
 - `internal/api`: provider registry lookup and unknown-provider errors
 - `internal/api/http`: request construction, retries, status/error handling, auth redaction
 - `internal/core`: dependency resolution, auth parameter behavior, pagination, extraction rules, marked-mode relations, full-sync desired-state conversion, PK validation for periodic reload
 - `internal/db`: provider registry lookup and unknown-provider errors
 - `internal/db/postgres`: SQL rendering, insert deduplication, PK handling, full-sync upsert/delete reconciliation SQL
 - `internal/db/clickhouse`: SQL rendering, PK and `ORDER BY` behavior, type translation, full-sync truncate-and-reload SQL
-- `internal/observability`: stable request log formatting, sorted params, error logging, failure-tolerant file writes
+- `internal/observability`: stable request log formatting, sorted params, event-log JSON lines, failure-tolerant file writes
 - `internal/openapi`: spec load success and file/content failures
+- `internal/runner`: one-shot/periodic phase transitions, request/error counters, derived table/row counts, next-run scheduling, bounded run history
 
 ## Review Rule
 
@@ -33,3 +36,9 @@ Any feature or bug fix should add or update tests in the package that owns that 
 - Postgres full-sync SQL performs upsert for changed rows and delete for missing rows
 - ClickHouse full-sync SQL truncates managed tables and reinserts the current snapshot
 - one-shot mode remains unchanged when periodic reload is not configured
+- control API defaults remain backward compatible for old config files
+- string config values expand environment variables so baked Docker configs can defer secrets to runtime
+- request counters and failed-request counters reflect actual connector events
+- status-derived managed-table and planned-row counts match generated plans
+- recent run history is bounded and newest-first
+- `apictl image build` rewrites `openapi_path` to the bundled file inside the image context

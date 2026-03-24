@@ -2,15 +2,15 @@ openapi_path: example/github.json
 
 api:
   base_url: https://api.github.com/
-  max_rpm: 60
-  request_timeout: 30
+  max_rpm: 10
+  request_timeout: 5
   retries:
     errors_max_retries: 3
     basic_retry_timeout: 2
 
 database:
-  provider: clickhouse
-  connection_string: host=localhost user=postgres password=postgres dbname=postgres port=5440 sslmode=disable
+  provider: postgres
+  connection_string: host=host.docker.internal user=postgres password=postgres dbname=postgres port=5440 sslmode=disable
 
 runtime:
   full_reload_interval_seconds: 10

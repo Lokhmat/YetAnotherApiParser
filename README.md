@@ -22,10 +22,14 @@ It can:
 - apply migrations directly to DB
 - periodically refetch the full API snapshot and reconcile managed DB tables
 - write request run logs to a configurable path
+- write structured runtime event logs to a configurable path
+- expose a small internal control API for status, recent runs, and log tailing
+- be packaged into a job-specific Docker image with the bundled `apictl` operator CLI
 
 ## Requirements
 
 - Go 1.24+
+- Docker (for `apictl image build` / `apictl run`)
 - PostgreSQL or ClickHouse (optional; if DB is unavailable, SQL is still written to file)
 
 ## Configuration
@@ -38,7 +42,13 @@ openapi_path: "example/api.json"
 runtime:
   sql_output_path: "res.sql"
   run_log_path: "runlog.log"
+  event_log_path: "events.log"
   full_reload_interval_seconds: 0
+
+control:
+  listen_addr: ":8080"
+  enabled: true
+  history_limit: 20
 
 api:
   provider: "openapi_http"
@@ -69,8 +79,13 @@ Compatibility notes:
 - `database.provider` defaults to `postgres`
 - `runtime.sql_output_path` defaults to `res.sql`
 - `runtime.run_log_path` defaults to `runlog.log`
+- `runtime.event_log_path` defaults to `events.log`
 - `runtime.full_reload_interval_seconds` defaults to `0` (disabled)
+- `control.listen_addr` defaults to `:8080`
+- `control.enabled` defaults to `true`
+- `control.history_limit` defaults to `20`
 - old config files without `provider` or `runtime` sections still work
+- string config values support environment-variable expansion via `${VAR}`
 
 ClickHouse adapter notes:
 
@@ -94,6 +109,8 @@ Behavior:
 5. Try applying the migration plan to DB.
 6. If DB apply fails, write exported SQL to `runtime.sql_output_path`.
 
+By default the process also starts an internal JSON control API on `control.listen_addr`.
+
 If `runtime.full_reload_interval_seconds > 0`:
 
 1. The parser still performs a full fetch of all fetchable operations.
@@ -115,9 +132,11 @@ Periodic full reload notes:
 The project is now split into four main modules:
 
 - `internal/config`: typed config loading, defaults, runtime paths, provider selection
+- `internal/control`: built-in JSON control API for health, status, recent runs, and log tails
 - `internal/api`: API connector registry and networking implementations
 - `internal/core`: fetch planning, FK resolution, extraction, and migration-plan building
 - `internal/db`: DB target registry and provider-specific execution/SQL export/full-sync reconciliation
+- `internal/runner`: reusable runtime loop with one-shot/periodic execution, status tracking, and bounded run history
 
 Connectors are compiled into the binary and selected by config.
 
@@ -284,6 +303,92 @@ Example line:
 2026-03-01T12:34:56Z method=GET url=https://api.binance.com/api/v3/exchangeInfo?symbols=%5BBTCUSDT+BNBBTC%5D params={symbols=[BTCUSDT BNBBTC]} status=200
 ```
 
+## Event Log
+
+Runtime lifecycle events and non-request failures are written as JSON lines to `runtime.event_log_path`.
+
+Example line:
+
+```json
+{"timestamp":"2026-03-24T09:00:00Z","level":"error","kind":"cycle_failed","message":"cycle failed","fields":{"cycle":2,"error":"db unavailable"}}
+```
+
+## Control API
+
+The built-in control API is intended for localhost or trusted private networks only.
+V1 ships without authentication.
+
+Endpoints:
+
+- `GET /healthz`
+- `GET /v1/status`
+- `GET /v1/runs`
+- `GET /v1/logs?source=requests|events&tail=N`
+
+`/v1/status` returns:
+
+- `job_mode`
+- `phase`
+- `cycle`
+- `started_at`
+- `finished_at`
+- `next_run_at`
+- `request_count`
+- `failed_request_count`
+- `managed_table_count`
+- `planned_row_count`
+- `applied_statement_count`
+- `last_error`
+- `last_success_at`
+
+Phases:
+
+- `starting`
+- `running_fetch`
+- `running_apply`
+- `sleeping`
+- `completed`
+- `failed`
+- `stopping`
+
+Recent run history is kept in memory only and resets on process restart.
+
+## Operator CLI
+
+`apictl` is the operator-facing CLI for Docker packaging and runtime inspection.
+
+Build it:
+
+```bash
+go build -o bin/apictl ./cmd/apictl
+```
+
+Build a job-specific Docker image with a bundled OpenAPI file and config:
+
+```bash
+./bin/apictl image build --tag api-parser:github --openapi example/github.json --config conf.yaml
+```
+
+Notes:
+
+- the image bakes the selected OpenAPI spec and a rewritten config into `/app/bundle`
+- `openapi_path` is rewritten to the bundled spec path automatically
+- keep secrets in environment variables and reference them from config with `${VAR}`
+
+Run the container and expose the control API:
+
+```bash
+./bin/apictl run --image api-parser:github --name api-parser-github --port 8080 --env API_TOKEN=secret
+```
+
+Inspect the running parser:
+
+```bash
+./bin/apictl status --addr http://127.0.0.1:8080
+./bin/apictl runs --addr http://127.0.0.1:8080
+./bin/apictl logs --addr http://127.0.0.1:8080 --source events --tail 20
+```
+
 ## Retry Policy
 
 - `5xx` responses are retried up to `api.retries.errors_max_retries` times.
@@ -298,6 +403,8 @@ Example line:
 - SQL export file at `runtime.sql_output_path` when a periodic full-reload cycle fails
 - DB migrations applied directly when DB execution succeeds
 - request trace log at `runtime.run_log_path`
+- runtime event log at `runtime.event_log_path`
+- live status and recent run history through the control API
 
 ## Project Examples
 

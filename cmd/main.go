@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/signal"
@@ -14,22 +15,33 @@ import (
 	"api-parser/internal/api"
 	_ "api-parser/internal/api/http"
 	"api-parser/internal/config"
+	"api-parser/internal/control"
 	"api-parser/internal/core"
 	"api-parser/internal/db"
 	_ "api-parser/internal/db/clickhouse"
 	_ "api-parser/internal/db/postgres"
 	"api-parser/internal/observability"
 	"api-parser/internal/openapi"
+	"api-parser/internal/runner"
 	"github.com/getkin/kin-openapi/openapi3"
 )
 
 var (
-	loadConfig       = config.Load
-	newRequestLogger = func(path string) observability.RequestLogger { return observability.NewFileRequestLogger(path) }
-	newAPIConnector  = api.New
-	newDBTarget      = db.New
-	loadOpenAPI      = openapi.Load
-	writeFile        = os.WriteFile
+	loadConfig        = config.Load
+	newRequestLogger  = func(path string) observability.RequestLogger { return observability.NewFileRequestLogger(path) }
+	newEventLogger    = func(path string) observability.EventLogger { return observability.NewFileEventLogger(path) }
+	newRequestTracker = func() *runner.RequestTracker { return runner.NewRequestTracker() }
+	newAPIConnector   = api.New
+	newDBTarget       = db.New
+	loadOpenAPI       = openapi.Load
+	writeFile         = os.WriteFile
+	newRunner         = func(cfg config.Config, spec *openapi3.T, planner runner.Planner, target core.MigrationTarget, out io.Writer, tracker *runner.RequestTracker, eventLogger observability.EventLogger, writeFile func(string, []byte, fs.FileMode) error, sleep func(context.Context, time.Duration) error) *runner.Runner {
+		return runner.New(cfg, spec, planner, target, out, tracker, eventLogger, writeFile, sleep)
+	}
+	newControlServer = func(cfg config.Config, source control.StateSource) (controlServer, error) {
+		server := control.NewServer(cfg, source)
+		return server, server.Start()
+	}
 	sleepWithContext = func(ctx context.Context, delay time.Duration) error {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
@@ -42,6 +54,10 @@ var (
 		}
 	}
 )
+
+type controlServer interface {
+	Shutdown(ctx context.Context) error
+}
 
 func main() {
 	configPath := flag.String("config", "conf.yaml", "config path")
@@ -61,7 +77,12 @@ func run(ctx context.Context, configPath string, out io.Writer) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	logger := newRequestLogger(cfg.Runtime.RunLogPath)
+	requestTracker := newRequestTracker()
+	logger := observability.MultiRequestLogger{
+		newRequestLogger(cfg.Runtime.RunLogPath),
+		requestTracker,
+	}
+	eventLogger := newEventLogger(cfg.Runtime.EventLogPath)
 	apiConnector, err := newAPIConnector(cfg.API.Provider, cfg.API, logger)
 	if err != nil {
 		return fmt.Errorf("build api provider: %w", err)
@@ -79,77 +100,20 @@ func run(ctx context.Context, configPath string, out io.Writer) error {
 	fmt.Fprintf(out, "Base URL: %s\n", cfg.API.BaseURL)
 
 	service := core.NewService(apiConnector)
-	if !cfg.Runtime.FullReloadEnabled {
-		return runOneShot(ctx, out, cfg, spec, service, dbTarget)
-	}
+	runLoop := newRunner(cfg, spec, service, dbTarget, out, requestTracker, eventLogger, writeFile, sleepWithContext)
 
-	if !dbTarget.Capabilities().CanFullSync {
-		return fmt.Errorf("db provider %q does not support periodic full reload", cfg.Database.Provider)
-	}
-
-	fmt.Fprintf(out, "Periodic full reload enabled: every %ds\n", cfg.Runtime.FullReloadIntervalSeconds)
-
-	for cycle := 1; ; cycle++ {
-		fullSyncPlan, err := service.GenerateFullSyncPlan(ctx, spec, cfg.API.BaseURL)
+	var srv controlServer
+	if cfg.ControlEnabled() {
+		srv, err = newControlServer(cfg, runLoop)
 		if err != nil {
-			return fmt.Errorf("generate full sync plan: %w", err)
+			return fmt.Errorf("start control server: %w", err)
 		}
-
-		sqlBytes, err := dbTarget.ExportFullSyncSQL(fullSyncPlan)
-		if err != nil {
-			return fmt.Errorf("export full sync sql: %w", err)
-		}
-		result, err := dbTarget.ApplyFullSync(ctx, fullSyncPlan)
-		if err != nil {
-			log.Printf("periodic full reload cycle %d failed: %v", cycle, err)
-			if len(sqlBytes) > 0 {
-				log.Printf("saving full sync SQL to %s...", cfg.Runtime.SQLOutputPath)
-				if writeErr := writeFile(cfg.Runtime.SQLOutputPath, sqlBytes, 0644); writeErr != nil {
-					return fmt.Errorf("failed to write migrations to file: %w", writeErr)
-				}
-				fmt.Fprintf(out, "Migrations saved to %s\n", cfg.Runtime.SQLOutputPath)
-			}
-		} else {
-			fmt.Fprintf(out, "Full reload cycle %d applied %d statements\n", cycle, result.AppliedCount)
-		}
-
-		if err := sleepWithContext(ctx, cfg.Runtime.FullReloadInterval); err != nil {
-			if err == context.Canceled {
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-func runOneShot(ctx context.Context, out io.Writer, cfg config.Config, spec *openapi3.T, service *core.Service, dbTarget core.MigrationTarget) error {
-	plan, err := service.GeneratePlan(ctx, spec, cfg.API.BaseURL)
-	if err != nil {
-		return fmt.Errorf("generate migration plan: %w", err)
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
 	}
 
-	sqlBytes, err := dbTarget.ExportSQL(plan)
-	if err != nil {
-		return fmt.Errorf("export sql: %w", err)
-	}
-
-	fmt.Fprintf(out, "\nGenerated %d operations:\n", len(plan.Operations))
-	if len(sqlBytes) > 0 {
-		fmt.Fprintf(out, "\n%s\n", string(sqlBytes))
-	}
-
-	result, err := dbTarget.Apply(ctx, plan)
-	if err != nil {
-		log.Printf("database apply failed: %v", err)
-		log.Printf("saving migrations to %s...", cfg.Runtime.SQLOutputPath)
-		if len(sqlBytes) > 0 {
-			if err := writeFile(cfg.Runtime.SQLOutputPath, sqlBytes, 0644); err != nil {
-				return fmt.Errorf("failed to write migrations to file: %w", err)
-			}
-			fmt.Fprintf(out, "Migrations saved to %s\n", cfg.Runtime.SQLOutputPath)
-		}
-		return nil
-	}
-	fmt.Fprintf(out, "Applied %d migrations\n", result.AppliedCount)
-	return nil
+	return runLoop.Run(ctx)
 }

@@ -283,6 +283,7 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 		}
 	}
 
+	relaxPlanNullability(plan)
 	return plan, nil
 }
 
@@ -456,6 +457,97 @@ func normalizeFullSyncRow(row InsertRow, columns []Column) InsertRow {
 		normalized.Values = append(normalized.Values, Value{Scalar: nil})
 	}
 	return normalized
+}
+
+func relaxPlanNullability(plan *MigrationPlan) {
+	if plan == nil {
+		return
+	}
+
+	tableColumns := make(map[string][]Column)
+	columnNullability := make(map[string]map[string]bool)
+	markNullable := func(tableName, columnName string) {
+		if _, ok := columnNullability[tableName]; !ok {
+			columnNullability[tableName] = make(map[string]bool)
+		}
+		columnNullability[tableName][columnName] = true
+	}
+
+	for _, op := range plan.Operations {
+		switch typed := op.(type) {
+		case CreateTableOp:
+			tableColumns[typed.TableName] = append([]Column{}, typed.Columns...)
+		case *CreateTableOp:
+			tableColumns[typed.TableName] = append([]Column{}, typed.Columns...)
+		}
+	}
+
+	for _, op := range plan.Operations {
+		switch typed := op.(type) {
+		case InsertRowsOp:
+			collectNullableColumns(typed.TableName, tableColumns[typed.TableName], typed.Rows, markNullable)
+		case *InsertRowsOp:
+			collectNullableColumns(typed.TableName, tableColumns[typed.TableName], typed.Rows, markNullable)
+		}
+	}
+
+	if len(columnNullability) == 0 {
+		return
+	}
+
+	for i, op := range plan.Operations {
+		switch typed := op.(type) {
+		case CreateTableOp:
+			relaxCreateTableColumns(&typed, columnNullability)
+			plan.Operations[i] = typed
+		case *CreateTableOp:
+			relaxCreateTableColumns(typed, columnNullability)
+		}
+	}
+}
+
+func collectNullableColumns(tableName string, columns []Column, rows []InsertRow, markNullable func(tableName, columnName string)) {
+	for _, row := range rows {
+		valueByColumn := make(map[string]Value, len(row.Columns))
+		for i, col := range row.Columns {
+			if i >= len(row.Values) {
+				markNullable(tableName, col)
+				continue
+			}
+			valueByColumn[col] = row.Values[i]
+			if row.Values[i].ArrayElementType == "" && row.Values[i].Scalar == nil {
+				markNullable(tableName, col)
+			}
+		}
+
+		for _, column := range columns {
+			if column.PrimaryKey {
+				continue
+			}
+			if _, exists := valueByColumn[column.Name]; !exists {
+				markNullable(tableName, column.Name)
+			}
+		}
+	}
+}
+
+func relaxCreateTableColumns(op *CreateTableOp, nullableColumns map[string]map[string]bool) {
+	if op == nil {
+		return
+	}
+	tableNullable := nullableColumns[op.TableName]
+	if len(tableNullable) == 0 {
+		return
+	}
+
+	for i := range op.Columns {
+		if op.Columns[i].PrimaryKey {
+			continue
+		}
+		if tableNullable[op.Columns[i].Name] {
+			op.Columns[i].Nullable = true
+		}
+	}
 }
 
 func buildCreateTableOpFromSchema(schemaRef *openapi3.SchemaRef, tableName string) (CreateTableOp, error) {

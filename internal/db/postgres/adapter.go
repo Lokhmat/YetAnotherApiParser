@@ -155,12 +155,12 @@ func (a *adapter) ApplyFullSync(ctx context.Context, plan *core.FullSyncPlan) (c
 
 func renderCreateTable(op core.CreateTableOp) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", op.TableName))
+	b.WriteString(fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n", quoteIdentifier(op.TableName)))
 	for i, col := range op.Columns {
 		if i > 0 {
 			b.WriteString(",\n")
 		}
-		b.WriteString(fmt.Sprintf("  %s %s", col.Name, col.Type))
+		b.WriteString(fmt.Sprintf("  %s %s", quoteIdentifier(col.Name), col.Type))
 		if col.PrimaryKey {
 			b.WriteString(" PRIMARY KEY")
 		} else if !col.Nullable {
@@ -178,10 +178,10 @@ func renderCreateLinkTable(op core.CreateLinkTableOp) string {
 	}
 	return fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS %s (\n  %s %s NOT NULL,\n  %s %s NOT NULL,\n  PRIMARY KEY (%s, %s)\n);",
-		op.TableName,
-		op.LeftColumn, op.LeftType,
-		op.RightColumn, op.RightType,
-		leftPK, rightPK,
+		quoteIdentifier(op.TableName),
+		quoteIdentifier(op.LeftColumn), op.LeftType,
+		quoteIdentifier(op.RightColumn), op.RightType,
+		quoteIdentifier(leftPK), quoteIdentifier(rightPK),
 	)
 }
 
@@ -217,7 +217,7 @@ func renderInsertRows(op core.InsertRowsOp, pkColumns []string, seenInsertKeys m
 	lines := make([]string, 0, len(op.Rows))
 	conflictClause := ""
 	if len(pkColumns) > 0 {
-		conflictClause = fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", strings.Join(pkColumns, ", "))
+		conflictClause = fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", quoteIdentifiers(pkColumns))
 	}
 	for _, row := range op.Rows {
 		if insertKey, ok := buildInsertDedupKey(op.TableName, row, pkColumns); ok {
@@ -235,8 +235,8 @@ func renderInsertRows(op core.InsertRowsOp, pkColumns []string, seenInsertKeys m
 		}
 		lines = append(lines, fmt.Sprintf(
 			"INSERT INTO %s (%s) VALUES (%s)%s;",
-			op.TableName,
-			strings.Join(row.Columns, ", "),
+			quoteIdentifier(op.TableName),
+			quoteIdentifiers(row.Columns),
 			strings.Join(values, ", "),
 			conflictClause,
 		))
@@ -347,8 +347,8 @@ func renderFullSyncUpserts(table core.FullSyncTable) []string {
 		}
 		lines = append(lines, fmt.Sprintf(
 			"INSERT INTO %s (%s) VALUES (%s)%s;",
-			table.Name,
-			strings.Join(row.Columns, ", "),
+			quoteIdentifier(table.Name),
+			quoteIdentifiers(row.Columns),
 			strings.Join(values, ", "),
 			renderConflictClause(table, row.Columns),
 		))
@@ -369,17 +369,18 @@ func renderConflictClause(table core.FullSyncTable, rowColumns []string) string 
 		if _, ok := pkSet[col]; ok {
 			continue
 		}
-		updates = append(updates, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
+		quotedCol := quoteIdentifier(col)
+		updates = append(updates, fmt.Sprintf("%s = EXCLUDED.%s", quotedCol, quotedCol))
 	}
 	if len(updates) == 0 {
-		return fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", strings.Join(table.PrimaryKey, ", "))
+		return fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", quoteIdentifiers(table.PrimaryKey))
 	}
-	return fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", strings.Join(table.PrimaryKey, ", "), strings.Join(updates, ", "))
+	return fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", quoteIdentifiers(table.PrimaryKey), strings.Join(updates, ", "))
 }
 
 func renderFullSyncDelete(table core.FullSyncTable) string {
 	if len(table.Rows) == 0 {
-		return fmt.Sprintf("DELETE FROM %s;", table.Name)
+		return fmt.Sprintf("DELETE FROM %s;", quoteIdentifier(table.Name))
 	}
 
 	clauses := make([]string, 0, len(table.Rows))
@@ -390,7 +391,7 @@ func renderFullSyncDelete(table core.FullSyncTable) string {
 			if index == -1 || index >= len(row.Values) {
 				continue
 			}
-			pkClauses = append(pkClauses, fmt.Sprintf("%s = %s", pk, toSQLLiteral(row.Values[index])))
+			pkClauses = append(pkClauses, fmt.Sprintf("%s = %s", quoteIdentifier(pk), toSQLLiteral(row.Values[index])))
 		}
 		if len(pkClauses) == 0 {
 			continue
@@ -398,9 +399,9 @@ func renderFullSyncDelete(table core.FullSyncTable) string {
 		clauses = append(clauses, "("+strings.Join(pkClauses, " AND ")+")")
 	}
 	if len(clauses) == 0 {
-		return fmt.Sprintf("DELETE FROM %s;", table.Name)
+		return fmt.Sprintf("DELETE FROM %s;", quoteIdentifier(table.Name))
 	}
-	return fmt.Sprintf("DELETE FROM %s WHERE NOT (%s);", table.Name, strings.Join(clauses, " OR "))
+	return fmt.Sprintf("DELETE FROM %s WHERE NOT (%s);", quoteIdentifier(table.Name), strings.Join(clauses, " OR "))
 }
 
 func indexOfColumn(columns []string, target string) int {
@@ -410,4 +411,21 @@ func indexOfColumn(columns []string, target string) int {
 		}
 	}
 	return -1
+}
+
+func quoteIdentifier(identifier string) string {
+	parts := strings.Split(identifier, ".")
+	quoted := make([]string, 0, len(parts))
+	for _, part := range parts {
+		quoted = append(quoted, `"`+strings.ReplaceAll(part, `"`, `""`)+`"`)
+	}
+	return strings.Join(quoted, ".")
+}
+
+func quoteIdentifiers(identifiers []string) string {
+	quoted := make([]string, 0, len(identifiers))
+	for _, identifier := range identifiers {
+		quoted = append(quoted, quoteIdentifier(identifier))
+	}
+	return strings.Join(quoted, ", ")
 }

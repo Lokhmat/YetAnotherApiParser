@@ -48,3 +48,25 @@ func TestFileRequestLoggerIgnoresOpenErrors(t *testing.T) {
 		StatusCode: 200,
 	})
 }
+
+func TestFileEventLoggerWritesJSONLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "events.log")
+	logger := NewFileEventLogger(path)
+
+	logger.LogEvent(Event{
+		Timestamp: time.Date(2026, 3, 24, 12, 0, 0, 0, time.UTC),
+		Level:     "info",
+		Kind:      "cycle_started",
+		Message:   "cycle started",
+		Fields:    map[string]any{"cycle": 1},
+	})
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read event log: %v", err)
+	}
+	line := string(data)
+	if !strings.Contains(line, `"kind":"cycle_started"`) || !strings.Contains(line, `"cycle":1`) {
+		t.Fatalf("unexpected event line: %s", line)
+	}
+}

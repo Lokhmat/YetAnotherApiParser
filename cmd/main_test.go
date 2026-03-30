@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"api-parser/internal/config"
+	"api-parser/internal/control"
 	"api-parser/internal/core"
 	"api-parser/internal/observability"
 )
@@ -54,6 +55,10 @@ func (t *cmdFakeTarget) Capabilities() core.Capabilities {
 }
 
 type cmdNoFullSyncTarget struct{}
+
+type noopControlServer struct{}
+
+func (noopControlServer) Shutdown(context.Context) error { return nil }
 
 func (cmdNoFullSyncTarget) Apply(context.Context, *core.MigrationPlan) (core.ApplyResult, error) {
 	return core.ApplyResult{}, nil
@@ -216,19 +221,32 @@ func stubMainDeps(t *testing.T) func() {
 
 	oldLoadConfig := loadConfig
 	oldNewRequestLogger := newRequestLogger
+	oldNewEventLogger := newEventLogger
+	oldNewRequestTracker := newRequestTracker
 	oldNewAPIConnector := newAPIConnector
 	oldNewDBTarget := newDBTarget
 	oldLoadOpenAPI := loadOpenAPI
 	oldWriteFile := writeFile
+	oldNewRunner := newRunner
+	oldNewControlServer := newControlServer
 	oldSleepWithContext := sleepWithContext
+
+	newControlServer = func(config.Config, control.StateSource) (controlServer, error) {
+		return noopControlServer{}, nil
+	}
+	newEventLogger = func(string) observability.EventLogger { return observability.NopEventLogger{} }
 
 	return func() {
 		loadConfig = oldLoadConfig
 		newRequestLogger = oldNewRequestLogger
+		newEventLogger = oldNewEventLogger
+		newRequestTracker = oldNewRequestTracker
 		newAPIConnector = oldNewAPIConnector
 		newDBTarget = oldNewDBTarget
 		loadOpenAPI = oldLoadOpenAPI
 		writeFile = oldWriteFile
+		newRunner = oldNewRunner
+		newControlServer = oldNewControlServer
 		sleepWithContext = oldSleepWithContext
 	}
 }

@@ -722,6 +722,82 @@ func TestGenerateFullSyncPlanFailsWithoutPrimaryKey(t *testing.T) {
 	}
 }
 
+func TestGeneratePlanRelaxesRequiredColumnsWhenRowsContainNullsOrMissingValues(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/commits": func(req FetchRequest) ([]byte, error) {
+				return []byte(`[
+					{"id":1,"author":null,"message":"first"},
+					{"id":2}
+				]`), nil
+			},
+		},
+	}
+
+	commitSchema := openapi3.NewArraySchema().WithItems(
+		openapi3.NewObjectSchema().
+			WithProperty("id", withPK(openapi3.NewIntegerSchema())).
+			WithProperty("author", openapi3.NewStringSchema()).
+			WithProperty("message", openapi3.NewStringSchema()).
+			WithRequired([]string{"id", "author", "message"}),
+	)
+
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/commits", &openapi3.PathItem{
+				Get: &openapi3.Operation{
+					Extensions: map[string]any{"x-res-type": "one-shot"},
+					Responses:  responseWithJSONSchema("#/components/schemas/commits", commitSchema),
+				},
+			}),
+		),
+	}
+
+	service := NewService(api)
+	plan, err := service.GeneratePlan(context.Background(), spec, "https://example.com")
+	if err != nil {
+		t.Fatalf("GeneratePlan returned error: %v", err)
+	}
+
+	var create CreateTableOp
+	found := false
+	for _, op := range plan.Operations {
+		switch typed := op.(type) {
+		case CreateTableOp:
+			if typed.TableName == "commits" {
+				create = typed
+				found = true
+			}
+		case *CreateTableOp:
+			if typed.TableName == "commits" {
+				create = *typed
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected create table op for commits")
+	}
+
+	nullableByName := make(map[string]bool)
+	pkByName := make(map[string]bool)
+	for _, col := range create.Columns {
+		nullableByName[col.Name] = col.Nullable
+		pkByName[col.Name] = col.PrimaryKey
+	}
+	if !pkByName["id"] {
+		t.Fatalf("expected id to remain primary key, got %+v", create.Columns)
+	}
+	if !nullableByName["author"] {
+		t.Fatalf("expected author to relax to nullable, got %+v", create.Columns)
+	}
+	if !nullableByName["message"] {
+		t.Fatalf("expected message to relax to nullable because a row omitted it, got %+v", create.Columns)
+	}
+}
+
 func buildThreeStepSpec() *openapi3.T {
 	id1Field := openapi3.NewIntegerSchema()
 	id1Field.Extensions = map[string]any{"x-response-data": map[string]any{"id": "id1"}}

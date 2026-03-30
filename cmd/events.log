@@ -1,0 +1,48 @@
+{"timestamp":"2026-03-24T18:19:01.337072Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:19:01.337166Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:19:01.337255Z","level":"info","kind":"cycle_completed","message":"cycle completed","fields":{"applied_count":3,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"succeeded","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:19:01.338166Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:19:01.338195Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:19:01.33828Z","level":"error","kind":"apply_failed","message":"database apply failed","fields":{"cycle":1,"error":"db unavailable"}}
+{"timestamp":"2026-03-24T18:19:01.338367Z","level":"error","kind":"cycle_failed","message":"cycle failed","fields":{"applied_count":0,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"failed","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:19:01.339864Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:19:01.33989Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:19:01.339923Z","level":"info","kind":"cycle_completed","message":"cycle completed","fields":{"applied_count":4,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"succeeded","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:19:01.33994Z","level":"info","kind":"runner_stopping","message":"runner stopping"}
+{"timestamp":"2026-03-24T18:19:01.340647Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:24:07.639358Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:24:07.639441Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:24:07.639521Z","level":"info","kind":"cycle_completed","message":"cycle completed","fields":{"applied_count":3,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"succeeded","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:24:07.640406Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:24:07.640437Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:24:07.640509Z","level":"error","kind":"apply_failed","message":"database apply failed","fields":{"cycle":1,"error":"db unavailable"}}
+{"timestamp":"2026-03-24T18:24:07.640584Z","level":"error","kind":"cycle_failed","message":"cycle failed","fields":{"applied_count":0,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"failed","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:24:07.642052Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:24:07.642087Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:24:07.642119Z","level":"info","kind":"cycle_completed","message":"cycle completed","fields":{"applied_count":4,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"succeeded","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:24:07.642137Z","level":"info","kind":"runner_stopping","message":"runner stopping"}
+{"timestamp":"2026-03-24T18:24:07.642844Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:25:15.234804Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:25:15.234886Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:25:15.235016Z","level":"info","kind":"cycle_completed","message":"cycle completed","fields":{"applied_count":3,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"succeeded","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:25:15.236449Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:25:15.236498Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:25:15.236612Z","level":"error","kind":"apply_failed","message":"database apply failed","fields":{"cycle":1,"error":"db unavailable"}}
+{"timestamp":"2026-03-24T18:25:15.236735Z","level":"error","kind":"cycle_failed","message":"cycle failed","fields":{"applied_count":0,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"failed","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:25:15.238898Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:25:15.238944Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:25:15.238988Z","level":"info","kind":"cycle_completed","message":"cycle completed","fields":{"applied_count":4,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"succeeded","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:25:15.239016Z","level":"info","kind":"runner_stopping","message":"runner stopping"}
+{"timestamp":"2026-03-24T18:25:15.240045Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:25:32.378159Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:25:32.37821Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:25:32.378305Z","level":"info","kind":"cycle_completed","message":"cycle completed","fields":{"applied_count":3,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"succeeded","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:25:32.379238Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:25:32.37929Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:25:32.379404Z","level":"error","kind":"apply_failed","message":"database apply failed","fields":{"cycle":1,"error":"db unavailable"}}
+{"timestamp":"2026-03-24T18:25:32.379548Z","level":"error","kind":"cycle_failed","message":"cycle failed","fields":{"applied_count":0,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"failed","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:25:32.381244Z","level":"info","kind":"runner_started","message":"runner started"}
+{"timestamp":"2026-03-24T18:25:32.381275Z","level":"info","kind":"cycle_started","message":"cycle started","fields":{"cycle":1}}
+{"timestamp":"2026-03-24T18:25:32.381306Z","level":"info","kind":"cycle_completed","message":"cycle completed","fields":{"applied_count":4,"cycle":1,"failed_request_count":0,"managed_table_count":1,"outcome":"succeeded","planned_row_count":1,"request_count":0}}
+{"timestamp":"2026-03-24T18:25:32.381326Z","level":"info","kind":"runner_stopping","message":"runner stopping"}
+{"timestamp":"2026-03-24T18:25:32.382113Z","level":"info","kind":"runner_started","message":"runner started"}

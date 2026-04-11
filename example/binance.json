@@ -216,7 +216,6 @@
                       "type": "array",
                       "items": {
                         "type": "object",
-                        "x-table-name": "exchange_rate_limits",
                         "properties": {
                           "rateLimitType": {
                             "type": "string",
@@ -260,6 +259,9 @@
                         "properties": {
                           "symbol": {
                             "type": "string",
+                            "x-response-data": {
+                              "id": "symbol"
+                            },
                             "x-pk": true,
                             "example": "ETHBTC"
                           },
@@ -338,7 +340,6 @@
                             "type": "array",
                             "items": {
                               "type": "object",
-                              "x-table-name": "exchange_symbol_filters",
                               "properties": {
                                 "filterType": {
                                   "type": "string",
@@ -959,6 +960,7 @@
     },
     "/api/v3/ticker/24hr": {
       "get": {
+        "x-res-type": "one-shot",
         "summary": "24hr Ticker Price Change Statistics",
         "description": "24 hour rolling window price change statistics. Careful when accessing this with no symbol.\n\n- If the symbol is not sent, tickers for all symbols will be returned in an array.\n\nWeight(IP):\n- `2` for a single symbol;\n- `80` when the symbol parameter is omitted;",
         "tags": [
@@ -981,14 +983,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/ticker"
-                    },
-                    {
-                      "$ref": "#/components/schemas/tickerList"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/tickerList"
                 }
               }
             }
@@ -1008,6 +1003,7 @@
     },
     "/api/v3/ticker/tradingDay": {
       "get": {
+        "x-res-type": "one-shot",
         "summary": "Trading Day Ticker",
         "description": "Price change statistics for a trading day.\n\nNotes:\n- Supported values for timeZone:\n  - Hours and minutes (e.g. -1:00, 05:45)\n  - Only hours (e.g. 0, 8, 4)\n\nWeight:\n- `4` for each requested symbol.\n- The weight for this request will cap at `200` once the number of symbols in the request is more than `50`.",
         "tags": [
@@ -1039,14 +1035,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/dayTicker"
-                    },
-                    {
-                      "$ref": "#/components/schemas/dayTickerList"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/dayTickerList"
                 }
               }
             }
@@ -1066,6 +1055,7 @@
     },
     "/api/v3/ticker/price": {
       "get": {
+        "x-res-type": "one-shot",
         "summary": "Symbol Price Ticker",
         "description": "Latest price for a symbol or symbols.\n\n- If the symbol is not sent, prices for all symbols will be returned in an array.\n\nWeight(IP):\n- `2` for a single symbol;\n- `4` when the symbol parameter is omitted;",
         "tags": [
@@ -1085,14 +1075,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/priceTicker"
-                    },
-                    {
-                      "$ref": "#/components/schemas/priceTickerList"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/priceTickerList"
                 }
               }
             }
@@ -1112,6 +1095,7 @@
     },
     "/api/v3/ticker/bookTicker": {
       "get": {
+        "x-res-type": "one-shot",
         "summary": "Symbol Order Book Ticker",
         "description": "Best price/qty on the order book for a symbol or symbols.\n\n- If the symbol is not sent, bookTickers for all symbols will be returned in an array.\n\nWeight(IP):\n- `2` for a single symbol;\n- `4` when the symbol parameter is omitted;",
         "tags": [
@@ -1131,14 +1115,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "$ref": "#/components/schemas/bookTicker"
-                    },
-                    {
-                      "$ref": "#/components/schemas/bookTickerList"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/bookTickerList"
                 }
               }
             }
@@ -41081,7 +41058,7 @@
         "x-param-data": {
           "type": "values",
           "values": [
-            "[\"BTCUSDT\",\"BNBBTC\"]"
+            "[\"BTCUSDT\",\"ETHUSDT\",\"BNBUSDT\",\"ADAUSDT\",\"SOLUSDT\"]"
           ]
         },
         "schema": {

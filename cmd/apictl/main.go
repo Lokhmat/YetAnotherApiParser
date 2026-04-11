@@ -46,7 +46,7 @@ func main() {
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: apictl <image|run|status|runs|logs> ...")
+		return errors.New("usage: apictl <image|run|status|runs|logs|cycle> ...")
 	}
 
 	switch args[0] {
@@ -60,6 +60,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runRuns(ctx, args[1:], stdout)
 	case "logs":
 		return runLogs(ctx, args[1:], stdout)
+	case "cycle":
+		return runCycle(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -193,6 +195,27 @@ func runLogs(ctx context.Context, args []string, stdout io.Writer) error {
 	return nil
 }
 
+func runCycle(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 || args[0] != "start" {
+		return errors.New("usage: apictl cycle start --addr <addr>")
+	}
+
+	fs := flag.NewFlagSet("cycle start", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	addr := fs.String("addr", "", "control API address")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*addr) == "" {
+		return errors.New("cycle start requires --addr")
+	}
+	if err := postJSON(ctx, strings.TrimRight(*addr, "/")+"/v1/cycle/trigger", nil); err != nil {
+		return err
+	}
+	_, _ = io.WriteString(stdout, "cycle trigger accepted\n")
+	return nil
+}
+
 func renderStatus(w io.Writer, status runner.Status) {
 	_, _ = fmt.Fprintf(w, "job_mode=%s phase=%s cycle=%d\n", status.JobMode, status.Phase, status.Cycle)
 	_, _ = fmt.Fprintf(w, "requests=%d failed_requests=%d tables=%d rows=%d applied=%d\n",
@@ -227,6 +250,27 @@ func getJSON(ctx context.Context, rawURL string, dest any) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return json.NewDecoder(resp.Body).Decode(dest)
+}
+
+func postJSON(ctx context.Context, rawURL string, dest any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, normalizeAddr(rawURL), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("request failed: status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if dest == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(dest)
 }

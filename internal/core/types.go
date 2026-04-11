@@ -1,6 +1,9 @@
 package core
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type FetchRequest struct {
 	Method           string
@@ -28,6 +31,8 @@ type MigrationTarget interface {
 	ApplyFullSync(ctx context.Context, plan *FullSyncPlan) (ApplyResult, error)
 	ExportSQL(plan *MigrationPlan) ([]byte, error)
 	ExportFullSyncSQL(plan *FullSyncPlan) ([]byte, error)
+	LoadCheckpoint(ctx context.Context, key string) (*Checkpoint, error)
+	SaveCheckpoints(ctx context.Context, checkpoints []Checkpoint) error
 	Capabilities() Capabilities
 }
 
@@ -38,6 +43,33 @@ type Capabilities struct {
 
 type ApplyResult struct {
 	AppliedCount int
+}
+
+type ResourceType string
+
+const (
+	ResourceTypeOneShot     ResourceType = "one-shot"
+	ResourceTypeFullReload  ResourceType = "full-reload"
+	ResourceTypeIncremental ResourceType = "incremental"
+)
+
+type Checkpoint struct {
+	Key             string
+	OperationPath   string
+	Method          string
+	ParamsJSON      string
+	PaginationParam string
+	PaginationType  string
+	ResumeValueJSON string
+	UpdatedAt       time.Time
+}
+
+type CyclePlan struct {
+	UpsertPlan          *MigrationPlan
+	FullSyncPlan        *FullSyncPlan
+	PendingCheckpoints  []Checkpoint
+	nextResponseValues  map[string][]interface{}
+	completedOneShotOps []string
 }
 
 type OperationKind string

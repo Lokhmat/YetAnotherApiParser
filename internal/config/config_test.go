@@ -26,7 +26,7 @@ runtime:
   sql_output_path: out.sql
   run_log_path: requests.log
   event_log_path: events.log
-  full_reload_interval_seconds: 45
+  cycle_interval_seconds: 45
 control:
   listen_addr: 127.0.0.1:9090
   enabled: false
@@ -56,8 +56,8 @@ control:
 	if cfg.Runtime.SQLOutputPath != "out.sql" || cfg.Runtime.RunLogPath != "requests.log" || cfg.Runtime.EventLogPath != "events.log" {
 		t.Fatalf("unexpected runtime config: %+v", cfg.Runtime)
 	}
-	if !cfg.Runtime.FullReloadEnabled || cfg.Runtime.FullReloadInterval != 45*time.Second {
-		t.Fatalf("unexpected full reload config: %+v", cfg.Runtime)
+	if !cfg.Runtime.CycleEnabled || cfg.Runtime.CycleInterval != 45*time.Second {
+		t.Fatalf("unexpected cycle config: %+v", cfg.Runtime)
 	}
 	if cfg.Control.ListenAddr != "127.0.0.1:9090" || cfg.ControlEnabled() || cfg.Control.HistoryLimit != 7 {
 		t.Fatalf("unexpected control config: %+v", cfg.Control)
@@ -105,11 +105,11 @@ runtime: {}
 	if cfg.Runtime.SQLOutputPath != "res.sql" || cfg.Runtime.RunLogPath != "runlog.log" || cfg.Runtime.EventLogPath != "events.log" {
 		t.Fatalf("unexpected runtime defaults: %+v", cfg.Runtime)
 	}
-	if cfg.Runtime.FullReloadEnabled {
-		t.Fatalf("expected full reload to be disabled by default")
+	if cfg.Runtime.CycleEnabled {
+		t.Fatalf("expected cycle execution to be disabled by default")
 	}
-	if cfg.Runtime.FullReloadInterval != 0 {
-		t.Fatalf("expected zero full reload interval, got %v", cfg.Runtime.FullReloadInterval)
+	if cfg.Runtime.CycleInterval != 0 {
+		t.Fatalf("expected zero cycle interval, got %v", cfg.Runtime.CycleInterval)
 	}
 	if !cfg.ControlEnabled() {
 		t.Fatalf("expected control API to be enabled by default")
@@ -174,6 +174,19 @@ func TestLoadInvalidYAMLReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(err.Error()), "yaml") {
 		t.Fatalf("expected YAML error, got %v", err)
+	}
+}
+
+func TestLoadRejectsLegacyFullReloadIntervalField(t *testing.T) {
+	path := writeTempConfig(t, `
+openapi_path: spec.yaml
+runtime:
+  full_reload_interval_seconds: 30
+`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "cycle_interval_seconds") {
+		t.Fatalf("expected legacy field error, got %v", err)
 	}
 }
 

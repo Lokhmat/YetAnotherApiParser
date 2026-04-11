@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -35,9 +36,11 @@ type RuntimeConfig struct {
 	RunLogPath    string `yaml:"run_log_path"`
 	EventLogPath  string `yaml:"event_log_path"`
 
-	FullReloadInterval        time.Duration `yaml:"-"`
-	FullReloadEnabled         bool          `yaml:"-"`
-	FullReloadIntervalSeconds int           `yaml:"full_reload_interval_seconds"`
+	CycleInterval        time.Duration `yaml:"-"`
+	CycleEnabled         bool          `yaml:"-"`
+	CycleIntervalSeconds int           `yaml:"cycle_interval_seconds"`
+
+	LegacyFullReloadIntervalSeconds *int `yaml:"full_reload_interval_seconds"`
 }
 
 type ControlConfig struct {
@@ -62,6 +65,9 @@ func Load(path string) (Config, error) {
 	}
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
+	}
+	if cfg.Runtime.LegacyFullReloadIntervalSeconds != nil {
+		return cfg, fmt.Errorf("runtime.full_reload_interval_seconds is no longer supported; use runtime.cycle_interval_seconds")
 	}
 	cfg.expandEnv()
 	cfg.applyDefaults()
@@ -100,11 +106,11 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Runtime.EventLogPath) == "" {
 		c.Runtime.EventLogPath = "events.log"
 	}
-	if c.Runtime.FullReloadIntervalSeconds < 0 {
-		c.Runtime.FullReloadIntervalSeconds = 0
+	if c.Runtime.CycleIntervalSeconds < 0 {
+		c.Runtime.CycleIntervalSeconds = 0
 	}
-	c.Runtime.FullReloadEnabled = c.Runtime.FullReloadIntervalSeconds > 0
-	c.Runtime.FullReloadInterval = time.Duration(c.Runtime.FullReloadIntervalSeconds) * time.Second
+	c.Runtime.CycleEnabled = c.Runtime.CycleIntervalSeconds > 0
+	c.Runtime.CycleInterval = time.Duration(c.Runtime.CycleIntervalSeconds) * time.Second
 
 	if strings.TrimSpace(c.Control.ListenAddr) == "" {
 		c.Control.ListenAddr = ":8080"

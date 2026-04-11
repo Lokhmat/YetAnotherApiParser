@@ -14,9 +14,14 @@
   "paths": {
     "/data": {
       "get": {
+        "x-res-type": "full-reload",
         "parameters": [
           {
             "name": "y1",
+            "x-param-data": {
+              "type": "operation",
+              "operation-id": "fromYear"
+            },
             "in": "query",
             "required": true,
             "explode": true,
@@ -27,6 +32,10 @@
           },
           {
             "name": "y2",
+            "x-param-data": {
+              "type": "operation",
+              "operation-id": "toYear"
+            },
             "in": "query",
             "required": true,
             "explode": true,
@@ -37,6 +46,14 @@
           },
           {
             "name": "datasetId",
+            "x-param-data": {
+              "type": "operation",
+              "operation-id": "datasetId",
+              "filter": {
+                "op": "in",
+                "values": [139]
+              }
+            },
             "in": "query",
             "required": true,
             "explode": true,
@@ -47,6 +64,14 @@
           },
           {
             "name": "publicationId",
+            "x-param-data": {
+              "type": "operation",
+              "operation-id": "publicationId",
+              "filter": {
+                "op": "in",
+                "values": [33]
+              }
+            },
             "in": "query",
             "required": true,
             "explode": true,
@@ -88,7 +113,11 @@
             "name": "publicationId",
             "x-param-data": {
               "type": "operation",
-              "operation-id": "publicationId"
+              "operation-id": "publicationId",
+              "filter": {
+                "op": "in",
+                "values": [33]
+              }
             },
             "in": "query",
             "required": true,
@@ -164,9 +193,18 @@
     },
     "/years": {
       "get": {
+        "x-res-type": "one-shot",
         "parameters": [
           {
             "name": "datasetId",
+            "x-param-data": {
+              "type": "operation",
+              "operation-id": "datasetId",
+              "filter": {
+                "op": "in",
+                "values": [139]
+              }
+            },
             "in": "query",
             "required": true,
             "explode": true,
@@ -497,6 +535,7 @@
             "type": "array",
             "items": {
               "type": "object",
+              "x-table-name": "raw_data",
               "properties": {
                 "element_id": {
                   "description": "id показателя",
@@ -524,6 +563,7 @@
                 },
                 "rowId": {
                   "description": "Дата id",
+                  "x-pk": true,
                   "type": "integer",
                   "format": "int32",
                   "nullable": true
@@ -656,6 +696,9 @@
           "properties": {
             "id": {
               "description": "Идентификатор записи показателя",
+              "x-response-data": {
+                "id": "datasetId"
+              },
               "type": "integer",
               "format": "int32",
               "x-pk": true,
@@ -792,12 +835,18 @@
           "properties": {
             "FromYear": {
               "description": "Год начала периода",
+              "x-response-data": {
+                "id": "fromYear"
+              },
               "type": "integer",
               "format": "int32",
               "nullable": true
             },
             "ToYear": {
               "description": "Год окончания периода",
+              "x-response-data": {
+                "id": "toYear"
+              },
               "type": "integer",
               "format": "int32",
               "nullable": true

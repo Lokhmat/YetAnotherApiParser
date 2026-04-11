@@ -24,6 +24,10 @@ func (stubTarget) ExportSQL(*core.MigrationPlan) ([]byte, error) { return nil, n
 
 func (stubTarget) ExportFullSyncSQL(*core.FullSyncPlan) ([]byte, error) { return nil, nil }
 
+func (stubTarget) LoadCheckpoint(context.Context, string) (*core.Checkpoint, error) { return nil, nil }
+
+func (stubTarget) SaveCheckpoints(context.Context, []core.Checkpoint) error { return nil }
+
 func (stubTarget) Capabilities() core.Capabilities {
 	return core.Capabilities{CanExportSQL: true}
 }

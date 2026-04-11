@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"api-parser/internal/config"
 	"api-parser/internal/core"
@@ -16,6 +17,8 @@ import (
 type adapter struct {
 	connectionString string
 }
+
+const checkpointTableName = "parser_checkpoints"
 
 func init() {
 	db.Register("postgres", func(cfg config.DatabaseConfig) (core.MigrationTarget, error) {
@@ -90,6 +93,96 @@ func (a *adapter) Apply(ctx context.Context, plan *core.MigrationPlan) (core.App
 		applied++
 	}
 	return core.ApplyResult{AppliedCount: applied}, nil
+}
+
+func (a *adapter) LoadCheckpoint(ctx context.Context, key string) (*core.Checkpoint, error) {
+	conn, err := a.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := ensureCheckpointTable(ctx, conn); err != nil {
+		return nil, err
+	}
+
+	row := conn.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT checkpoint_key, operation_path, method, params_json, pagination_param, pagination_type, resume_value_json, updated_at FROM %s WHERE checkpoint_key = $1`,
+		quoteIdentifier(checkpointTableName),
+	), key)
+	var checkpoint core.Checkpoint
+	if err := row.Scan(
+		&checkpoint.Key,
+		&checkpoint.OperationPath,
+		&checkpoint.Method,
+		&checkpoint.ParamsJSON,
+		&checkpoint.PaginationParam,
+		&checkpoint.PaginationType,
+		&checkpoint.ResumeValueJSON,
+		&checkpoint.UpdatedAt,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load checkpoint: %w", err)
+	}
+	return &checkpoint, nil
+}
+
+func (a *adapter) SaveCheckpoints(ctx context.Context, checkpoints []core.Checkpoint) error {
+	if len(checkpoints) == 0 {
+		return nil
+	}
+	conn, err := a.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin checkpoint transaction: %w", err)
+	}
+	if err := ensureCheckpointTable(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	stmt := fmt.Sprintf(
+		`INSERT INTO %s (checkpoint_key, operation_path, method, params_json, pagination_param, pagination_type, resume_value_json, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+ON CONFLICT (checkpoint_key) DO UPDATE
+SET operation_path = EXCLUDED.operation_path,
+    method = EXCLUDED.method,
+    params_json = EXCLUDED.params_json,
+    pagination_param = EXCLUDED.pagination_param,
+    pagination_type = EXCLUDED.pagination_type,
+    resume_value_json = EXCLUDED.resume_value_json,
+    updated_at = EXCLUDED.updated_at`,
+		quoteIdentifier(checkpointTableName),
+	)
+	for _, checkpoint := range checkpoints {
+		updatedAt := checkpoint.UpdatedAt
+		if updatedAt.IsZero() {
+			updatedAt = time.Now().UTC()
+		}
+		if _, err := tx.ExecContext(ctx, stmt,
+			checkpoint.Key,
+			checkpoint.OperationPath,
+			checkpoint.Method,
+			checkpoint.ParamsJSON,
+			checkpoint.PaginationParam,
+			checkpoint.PaginationType,
+			checkpoint.ResumeValueJSON,
+			updatedAt,
+		); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("save checkpoint: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit checkpoints: %w", err)
+	}
+	return nil
 }
 
 func (a *adapter) ExportFullSyncSQL(plan *core.FullSyncPlan) ([]byte, error) {
@@ -215,10 +308,6 @@ func collectPrimaryKeys(plan *core.MigrationPlan) map[string][]string {
 
 func renderInsertRows(op core.InsertRowsOp, pkColumns []string, seenInsertKeys map[string]map[string]struct{}) []string {
 	lines := make([]string, 0, len(op.Rows))
-	conflictClause := ""
-	if len(pkColumns) > 0 {
-		conflictClause = fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", quoteIdentifiers(pkColumns))
-	}
 	for _, row := range op.Rows {
 		if insertKey, ok := buildInsertDedupKey(op.TableName, row, pkColumns); ok {
 			if _, exists := seenInsertKeys[op.TableName]; !exists {
@@ -233,6 +322,7 @@ func renderInsertRows(op core.InsertRowsOp, pkColumns []string, seenInsertKeys m
 		for _, value := range row.Values {
 			values = append(values, toSQLLiteral(value))
 		}
+		conflictClause := buildPostgresConflictClause(row, pkColumns)
 		lines = append(lines, fmt.Sprintf(
 			"INSERT INTO %s (%s) VALUES (%s)%s;",
 			quoteIdentifier(op.TableName),
@@ -242,6 +332,65 @@ func renderInsertRows(op core.InsertRowsOp, pkColumns []string, seenInsertKeys m
 		))
 	}
 	return lines
+}
+
+func buildPostgresConflictClause(row core.InsertRow, pkColumns []string) string {
+	if len(pkColumns) == 0 {
+		return ""
+	}
+	updates := make([]string, 0, len(row.Columns))
+	for _, column := range row.Columns {
+		if containsString(pkColumns, column) {
+			continue
+		}
+		updates = append(updates, fmt.Sprintf("%s = EXCLUDED.%s", quoteIdentifier(column), quoteIdentifier(column)))
+	}
+	if len(updates) == 0 {
+		return fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", quoteIdentifiers(pkColumns))
+	}
+	return fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", quoteIdentifiers(pkColumns), strings.Join(updates, ", "))
+}
+
+func containsString(values []string, candidate string) bool {
+	for _, value := range values {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *adapter) open(ctx context.Context) (*sql.DB, error) {
+	conn, err := sql.Open("postgres", a.connectionString)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if err := conn.PingContext(ctx); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	return conn, nil
+}
+
+type checkpointExecer interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+func ensureCheckpointTable(ctx context.Context, execer checkpointExecer) error {
+	_, err := execer.ExecContext(ctx, fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+  checkpoint_key TEXT PRIMARY KEY,
+  operation_path TEXT NOT NULL,
+  method TEXT NOT NULL,
+  params_json JSONB NOT NULL,
+  pagination_param TEXT NOT NULL,
+  pagination_type TEXT NOT NULL,
+  resume_value_json JSONB NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);`, quoteIdentifier(checkpointTableName)))
+	if err != nil {
+		return fmt.Errorf("ensure checkpoint table: %w", err)
+	}
+	return nil
 }
 
 func buildInsertDedupKey(tableName string, row core.InsertRow, pkColumns []string) (string, bool) {

@@ -17,6 +17,7 @@ import (
 type StateSource interface {
 	StatusSnapshot() runner.Status
 	RunsSnapshot() []runner.RunSummary
+	TriggerCycle() error
 }
 
 type Server struct {
@@ -35,6 +36,7 @@ func NewServer(cfg config.Config, source StateSource) *Server {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/status", s.handleStatus)
 	mux.HandleFunc("/v1/runs", s.handleRuns)
+	mux.HandleFunc("/v1/cycle/trigger", s.handleTriggerCycle)
 	mux.HandleFunc("/v1/logs", s.handleLogs)
 	s.httpServer = &http.Server{Handler: mux}
 	return s
@@ -75,6 +77,22 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleRuns(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.source.RunsSnapshot())
+}
+
+func (s *Server) handleTriggerCycle(w http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method must be POST"})
+		return
+	}
+	if err := s.source.TriggerCycle(); err != nil {
+		statusCode := http.StatusConflict
+		if errors.Is(err, runner.ErrManualCycleUnsupported) {
+			statusCode = http.StatusBadRequest
+		}
+		writeJSON(w, statusCode, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "scheduled"})
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, req *http.Request) {

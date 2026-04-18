@@ -20,7 +20,9 @@ It can:
 - flatten marked nested response objects into separate tables (`x-table-name`)
 - export SQL through the DB adapter
 - apply migrations directly to DB
-- periodically refetch the full API snapshot and reconcile managed DB tables
+- run periodic fetch/apply cycles
+- reconcile `full-reload` tables to the latest API snapshot
+- append or upsert `incremental` tables from saved checkpoints
 - write request run logs to a configurable path
 - write structured runtime event logs to a configurable path
 - expose a small internal control API for status, recent runs, and log tailing
@@ -43,7 +45,7 @@ runtime:
   sql_output_path: "res.sql"
   run_log_path: "runlog.log"
   event_log_path: "events.log"
-  full_reload_interval_seconds: 0
+  cycle_interval_seconds: 0
 
 control:
   listen_addr: ":8080"
@@ -80,10 +82,11 @@ Compatibility notes:
 - `runtime.sql_output_path` defaults to `res.sql`
 - `runtime.run_log_path` defaults to `runlog.log`
 - `runtime.event_log_path` defaults to `events.log`
-- `runtime.full_reload_interval_seconds` defaults to `0` (disabled)
+- `runtime.cycle_interval_seconds` defaults to `0` (disabled)
 - `control.listen_addr` defaults to `:8080`
 - `control.enabled` defaults to `true`
 - `control.history_limit` defaults to `20`
+- `runtime.full_reload_interval_seconds` is rejected; use `runtime.cycle_interval_seconds`
 - old config files without `provider` or `runtime` sections still work
 - string config values support environment-variable expansion via `${VAR}`
 
@@ -111,21 +114,27 @@ Behavior:
 
 By default the process also starts an internal JSON control API on `control.listen_addr`.
 
-If `runtime.full_reload_interval_seconds > 0`:
+If `runtime.cycle_interval_seconds > 0`:
 
-1. The parser still performs a full fetch of all fetchable operations.
-2. It converts the fetched snapshot into desired table contents keyed by primary key.
-3. It keeps running and repeats the full fetch every configured interval.
-4. Each cycle reconciles parser-managed tables with the latest API snapshot.
-5. If a cycle fails, the cycle SQL snapshot is written to `runtime.sql_output_path` and the process keeps polling.
+1. The parser runs a startup cycle immediately.
+2. It keeps running and repeats the cycle every configured interval.
+3. Each operation decides its own fetch behavior through `x-res-type`.
+4. If a cycle fails, the cycle SQL snapshot is written to `runtime.sql_output_path` and the process keeps polling.
 
-Periodic full reload notes:
+Cycle notes:
 
-- enabled globally from config, not per operation
-- every managed table must have PK metadata (`x-pk` or generated link-table PK), otherwise startup fails
-- synchronization scope is limited to parser-managed tables from the loaded spec
-- `postgres` uses row-level upsert/delete reconciliation inside one DB transaction
-- `clickhouse` uses full-table refresh per managed table (`TRUNCATE` + reinsert), so convergence is eventual but not transactional across the whole cycle
+- `one-shot` operations run only in the first successful process cycle
+- `full-reload` operations fetch a full snapshot every cycle and reconcile only their owned tables
+- `incremental` operations require cursor or offset pagination and save checkpoints per operation path plus resolved non-pagination params
+- `incremental` supports two modes:
+  - default resume-pagination: first cycle fetches the full paginated dataset, later cycles resume from the saved cursor or offset
+  - `x-incremental.strategy=head-watermark`: every cycle restarts from the first page, applies only new or newly-visible boundary rows, and stops after paging past the saved watermark boundary
+- incremental checkpoints advance only after DB apply succeeds
+- incremental response-derived dependency values are kept only in process memory; they are not restored from DB after restart
+- tables cannot be produced by mixed `x-res-type` modes
+- `full-reload` and `incremental` owned tables must have PK metadata (`x-pk` or generated link-table PK)
+- `postgres` uses row-level upsert/delete reconciliation for `full-reload` and PK upsert for incremental/one-shot writes
+- `clickhouse` uses full-table refresh for `full-reload` tables and PK delete+insert for incremental/one-shot writes
 
 ## Architecture Overview
 
@@ -148,9 +157,21 @@ See [`tests.md`](tests.md) for the package-by-package testing strategy and the c
 
 ### `x-res-type` (operation)
 
-Marks a GET operation as fetchable by parser.
+Marks a GET operation as fetchable by parser and selects its cycle behavior.
 
 Without `x-res-type`, operation is ignored.
+
+Supported values:
+
+- `one-shot`: fetch once during the first successful process cycle, then never re-fetch
+- `full-reload`: fetch the full dataset every cycle and reconcile owned tables to that snapshot
+- `incremental`: fetch incrementally with either resume-pagination checkpoints or explicit `x-incremental` strategy metadata
+
+Rules:
+
+1. Invalid `x-res-type` values fail startup.
+2. Tables cannot be produced by mixed `x-res-type` modes.
+3. `full-reload` and `incremental` owned tables must have PK metadata.
 
 ### `x-param-data` (operation parameter)
 
@@ -196,6 +217,54 @@ Rules:
 5. At most one pagination param (`cursor` or `offset`) is allowed per operation.
 6. Cursor pagination stops when the configured dot-path is missing, null, or empty.
 7. Offset pagination starts at `offset.start`, increments by `offset.increment`, and stops when a page produces no insertable rows.
+8. `x-res-type=incremental` is allowed only when one pagination param is defined.
+
+### `x-incremental` (operation)
+
+Adds explicit incremental semantics for `x-res-type: incremental`.
+
+If omitted, incremental uses resume-pagination checkpoints with the configured cursor or offset parameter.
+
+Supported form:
+
+```yaml
+x-incremental:
+  strategy: head-watermark
+  items-path: data.items
+  watermark:
+    path: updated_at
+    type: datetime
+  key-paths: [id]
+```
+
+For top-level array responses, use:
+
+```yaml
+x-incremental:
+  strategy: head-watermark
+  items-path: $
+  watermark:
+    path: commit.author.date
+    type: datetime
+  key-paths: [node_id]
+```
+
+Rules:
+
+1. `x-incremental` is allowed only when `x-res-type=incremental`.
+2. V1 supports only `strategy: head-watermark`.
+3. `head-watermark` still requires exactly one pagination param from `x-param-data.type=cursor|offset`.
+4. `items-path` must resolve to the paginated collection of object records in the successful JSON response schema. Use `"$"` when the response itself is the item array.
+5. `watermark.path` and every entry in `key-paths` must resolve inside each collection item.
+6. `watermark.type` must be one of `number`, `string`, or `datetime`.
+7. `key-paths` must be non-empty and must not contain duplicates.
+
+`head-watermark` assumptions:
+
+- pages are ordered descending by the configured watermark
+- all records with the same watermark appear before any strictly older records
+- `key-paths` uniquely identify the page item at the watermark boundary
+- deletes are not reconciled; writes remain upsert/preserve only
 
 ### `x-response-data` (response property)
 
@@ -240,7 +309,7 @@ Used in both:
 - classic top-level table mode
 - `x-table-name` marked mode
 
-When periodic full reload is enabled, every managed table must have a primary key so rows can be updated and deleted during reconciliation.
+When periodic cycles use `full-reload` or `incremental` modes, every managed table must have a primary key so rows can be updated safely.
 
 ### `x-table-name` (response object schema)
 
@@ -270,6 +339,19 @@ For fetchable operations (`x-res-type`):
 7. Extract response-published values from `x-response-data` and feed downstream operations.
 
 Operations without any combination-producing `x-param-data` are called once with empty parameter combination.
+
+For `incremental` operations, the parser stores a checkpoint keyed by HTTP method, operation path, pagination parameter, and resolved non-pagination params.
+
+Checkpoint payloads are strategy-specific:
+
+- resume-pagination stores the last successful cursor or offset resume value
+- `head-watermark` stores:
+  - `strategy: "head-watermark"`
+  - `watermark_type`
+  - `watermark_value`
+  - `boundary_keys` as sorted canonical JSON tuples for records seen at that watermark
+
+If a saved checkpoint payload does not match the configured incremental strategy, parser logs a warning, ignores that checkpoint, and starts from the strategy's initial state.
 
 ## Request Parameter Serialization Notes
 
@@ -323,7 +405,14 @@ Endpoints:
 - `GET /healthz`
 - `GET /v1/status`
 - `GET /v1/runs`
+- `POST /v1/cycle/trigger`
 - `GET /v1/logs?source=requests|events&tail=N`
+
+`POST /v1/cycle/trigger` accepts a manual cycle start when the runner is in periodic mode and currently sleeping between cycles. It returns:
+
+- `202 Accepted` when the next cycle is scheduled immediately
+- `409 Conflict` if the runner is already busy or a manual trigger is already pending
+- `400 Bad Request` if periodic cycles are disabled
 
 `/v1/status` returns:
 
@@ -386,6 +475,7 @@ Inspect the running parser:
 ```bash
 ./bin/apictl status --addr http://127.0.0.1:8080
 ./bin/apictl runs --addr http://127.0.0.1:8080
+./bin/apictl cycle start --addr http://127.0.0.1:8080
 ./bin/apictl logs --addr http://127.0.0.1:8080 --source events --tail 20
 ```
 

@@ -15,11 +15,19 @@ import (
 )
 
 type Service struct {
-	api APIConnector
+	api                 APIConnector
+	compiledSpec        *openapi3.T
+	operations          []*compiledOperation
+	responseValues      map[string][]interface{}
+	completedOneShotOps map[string]bool
 }
 
 func NewService(api APIConnector) *Service {
-	return &Service{api: api}
+	return &Service{
+		api:                 api,
+		responseValues:      make(map[string][]interface{}),
+		completedOneShotOps: make(map[string]bool),
+	}
 }
 
 type containerKind string
@@ -53,6 +61,20 @@ const (
 	paramDataTypeOffset    paramDataType = "offset"
 )
 
+type incrementalStrategy string
+
+const (
+	incrementalStrategyHeadWatermark incrementalStrategy = "head-watermark"
+)
+
+type watermarkType string
+
+const (
+	watermarkTypeNumber   watermarkType = "number"
+	watermarkTypeString   watermarkType = "string"
+	watermarkTypeDateTime watermarkType = "datetime"
+)
+
 type ParamFilterSpec struct {
 	Op     string
 	Value  interface{}
@@ -80,6 +102,18 @@ type AuthParamSpec struct {
 	EnvVar    string
 }
 
+type IncrementalSpec struct {
+	Strategy           incrementalStrategy
+	ItemsPath          string
+	ItemsPathParts     []string
+	ItemsPathIsRoot    bool
+	WatermarkPath      string
+	WatermarkPathParts []string
+	WatermarkType      watermarkType
+	KeyPaths           []string
+	KeyPathParts       [][]string
+}
+
 type operationInfo struct {
 	Path           string
 	Op             *openapi3.Operation
@@ -88,6 +122,45 @@ type operationInfo struct {
 	AuthSpecs      []AuthParamSpec
 	IsFetched      bool
 	Plan           *operationExtractionPlan
+}
+
+type compiledOperation struct {
+	Path            string
+	Op              *openapi3.Operation
+	ResourceType    ResourceType
+	ParamSpecs      []ParamDataSpec
+	PaginationSpec  *ParamDataSpec
+	IncrementalSpec *IncrementalSpec
+	AuthSpecs       []AuthParamSpec
+	Plan            *operationExtractionPlan
+	CreateOps       []MigrationOperation
+	OwnedTables     []string
+}
+
+type headWatermarkCheckpointValue struct {
+	Strategy       string      `json:"strategy"`
+	WatermarkType  string      `json:"watermark_type"`
+	WatermarkValue interface{} `json:"watermark_value"`
+	BoundaryKeys   []string    `json:"boundary_keys"`
+}
+
+type headWatermarkCheckpointState struct {
+	WatermarkType  watermarkType
+	WatermarkValue interface{}
+	BoundaryKeys   map[string]bool
+}
+
+type headWatermarkPageResult struct {
+	FilteredPayload []byte
+	RawItemCount    int
+	StopAfterPage   bool
+}
+
+type headWatermarkCycleState struct {
+	Observed      bool
+	WatermarkType watermarkType
+	MaxWatermark  interface{}
+	BoundaryKeys  map[string]bool
 }
 
 type relationColumnPlan struct {
@@ -148,97 +221,46 @@ type tableState struct {
 var sqlIdentPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL string) (*MigrationPlan, error) {
-	plan := &MigrationPlan{}
-	operationDependencies := make(map[string]*operationInfo)
-	generatedTables := make(map[string]bool)
+	plan, err := s.GenerateCyclePlan(ctx, spec, baseURL, memoryCheckpointStore{})
+	if err != nil {
+		return nil, err
+	}
+	return mergeCyclePlan(plan)
+}
 
-	operations := s.collectOperationsWithResType(spec)
-	for _, opInfo := range operations {
-		paramSpecs, paginationSpec, err := s.getParamDataSpecs(opInfo.path, opInfo.op)
-		if err != nil {
-			return nil, fmt.Errorf("parse x-param-data for %s: %w", opInfo.path, err)
-		}
-		if err := validateResponseDataHints(opInfo.path, opInfo.op); err != nil {
-			return nil, err
-		}
-		authSpecs, err := s.getAuthParamSpecs(opInfo.path, opInfo.op)
-		if err != nil {
-			return nil, fmt.Errorf("parse x-auth for %s: %w", opInfo.path, err)
-		}
-		extractionPlan, err := s.buildOperationExtractionPlan(opInfo.op)
-		if err != nil {
-			return nil, fmt.Errorf("build extraction plan for %s: %w", opInfo.path, err)
-		}
+func (s *Service) GenerateFullSyncPlan(ctx context.Context, spec *openapi3.T, baseURL string) (*FullSyncPlan, error) {
+	plan, err := s.GeneratePlan(ctx, spec, baseURL)
+	if err != nil {
+		return nil, err
+	}
+	return buildFullSyncPlan(plan)
+}
 
-		operationDependencies[opInfo.path] = &operationInfo{
-			Path:           opInfo.path,
-			Op:             opInfo.op,
-			ParamSpecs:     paramSpecs,
-			PaginationSpec: paginationSpec,
-			AuthSpecs:      authSpecs,
-			Plan:           extractionPlan,
-			IsFetched:      false,
-		}
-
-		if extractionPlan != nil && extractionPlan.HasMarks {
-			for _, node := range extractionPlan.Nodes {
-				if generatedTables[node.TableName] {
-					continue
-				}
-				plan.Add(buildCreateTableOpFromMarkedNode(node, s.getRelationColumnsForNode(extractionPlan, node.Path)))
-				generatedTables[node.TableName] = true
-			}
-			for _, rel := range extractionPlan.Relations {
-				if rel.Kind != relationLinkTable || generatedTables[rel.JoinTableName] {
-					continue
-				}
-				plan.Add(CreateLinkTableOp{
-					TableName:   rel.JoinTableName,
-					LeftColumn:  rel.JoinParentCol,
-					LeftType:    rel.JoinParentType,
-					RightColumn: rel.JoinChildCol,
-					RightType:   rel.JoinChildType,
-					PrimaryKey:  []string{rel.JoinParentCol, rel.JoinChildCol},
-				})
-				generatedTables[rel.JoinTableName] = true
-			}
-			continue
-		}
-
-		resp := s.getSuccessResponse(opInfo.op)
-		if resp == nil || resp.Value == nil {
-			continue
-		}
-		media := resp.Value.Content.Get("application/json")
-		if media == nil || media.Schema == nil {
-			continue
-		}
-		schemaName := s.getSchemaName(media.Schema)
-		if schemaName == "" || generatedTables[schemaName] {
-			continue
-		}
-		createTable, err := buildCreateTableOpFromSchema(media.Schema, schemaName)
-		if err != nil {
-			return nil, fmt.Errorf("build create table for %s: %w", opInfo.path, err)
-		}
-		plan.Add(createTable)
-		generatedTables[schemaName] = true
+func (s *Service) GenerateCyclePlan(ctx context.Context, spec *openapi3.T, baseURL string, checkpoints MigrationTarget) (*CyclePlan, error) {
+	if err := s.prepareSpec(spec); err != nil {
+		return nil, err
 	}
 
-	fetchedResponseValues := make(map[string][]interface{})
+	upsertPlan := &MigrationPlan{}
+	fullReloadPlan := &MigrationPlan{}
+	workingResponseValues := cloneInterfaceMap(s.responseValues)
+	fetchedThisCycle := make(map[string]bool, len(s.operations))
+	createdForMode := map[ResourceType]map[string]bool{
+		ResourceTypeOneShot:     make(map[string]bool),
+		ResourceTypeIncremental: make(map[string]bool),
+		ResourceTypeFullReload:  make(map[string]bool),
+	}
+	completedOneShotOps := make([]string, 0)
+	pendingCheckpoints := make([]Checkpoint, 0)
 
 	for {
 		shouldContinue := false
-
-		paths := make([]string, 0, len(operationDependencies))
-		for p := range operationDependencies {
-			paths = append(paths, p)
-		}
-		sort.Strings(paths)
-
-		for _, path := range paths {
-			opInfo := operationDependencies[path]
-			if opInfo.IsFetched {
+		for _, opInfo := range s.operations {
+			if fetchedThisCycle[opInfo.Path] {
+				continue
+			}
+			if opInfo.ResourceType == ResourceTypeOneShot && s.completedOneShotOps[opInfo.Path] {
+				fetchedThisCycle[opInfo.Path] = true
 				continue
 			}
 
@@ -246,7 +268,7 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 			if len(opInfo.ParamSpecs) == 0 {
 				combinations = [][]interface{}{{}}
 			} else {
-				valueLists, ready, err := s.buildEffectiveParamValueLists(path, opInfo.ParamSpecs, fetchedResponseValues)
+				valueLists, ready, err := s.buildEffectiveParamValueLists(opInfo.Path, opInfo.ParamSpecs, workingResponseValues)
 				if err != nil {
 					return nil, err
 				}
@@ -256,26 +278,126 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 				combinations = s.generateCombinations(valueLists)
 			}
 
-			if len(combinations) > 0 {
-				for _, combo := range combinations {
-					params := s.buildParamsMapFromSpecs(opInfo.ParamSpecs, combo)
-					params, missingAuth := s.applyAuthParams(path, params, opInfo.AuthSpecs)
-					if missingAuth {
-						continue
-					}
-					insertOps, err := s.fetchAndBuildInsertOps(ctx, baseURL, path, opInfo.Op, params, opInfo.PaginationSpec, fetchedResponseValues, opInfo.Plan, opInfo.AuthSpecs)
+			if len(combinations) == 0 {
+				fetchedThisCycle[opInfo.Path] = true
+				continue
+			}
+
+			targetPlan := upsertPlan
+			if opInfo.ResourceType == ResourceTypeFullReload {
+				targetPlan = fullReloadPlan
+			}
+			if !createdForMode[opInfo.ResourceType][opInfo.Path] {
+				for _, createOp := range opInfo.CreateOps {
+					targetPlan.Add(createOp)
+				}
+				createdForMode[opInfo.ResourceType][opInfo.Path] = true
+			}
+
+			for _, combo := range combinations {
+				baseParams := s.buildParamsMapFromSpecs(opInfo.ParamSpecs, combo)
+				requestParams, missingAuth := s.applyAuthParams(opInfo.Path, baseParams, opInfo.AuthSpecs)
+				if missingAuth {
+					continue
+				}
+
+				if opInfo.ResourceType == ResourceTypeIncremental && opInfo.IncrementalSpec != nil {
+					checkpointKey, err := buildCheckpointKey("GET", opInfo.Path, baseParams, opInfo.PaginationSpec.ParamName)
 					if err != nil {
-						log.Printf("failed to build INSERT ops for GET %s: %v", path, err)
+						return nil, fmt.Errorf("build checkpoint key for %s: %w", opInfo.Path, err)
+					}
+					checkpoint, err := checkpoints.LoadCheckpoint(ctx, checkpointKey)
+					if err != nil {
+						return nil, fmt.Errorf("load checkpoint for %s: %w", opInfo.Path, err)
+					}
+					insertOps, pendingCheckpoint, err := s.fetchAndBuildHeadWatermarkInsertOps(
+						ctx,
+						baseURL,
+						opInfo.Path,
+						opInfo.Op,
+						requestParams,
+						baseParams,
+						opInfo.PaginationSpec,
+						opInfo.IncrementalSpec,
+						workingResponseValues,
+						opInfo.Plan,
+						opInfo.AuthSpecs,
+						checkpointKey,
+						checkpoint,
+					)
+					if err != nil {
+						log.Printf("failed to build INSERT ops for GET %s: %v", opInfo.Path, err)
 						continue
 					}
 					for _, op := range insertOps {
-						plan.Add(op)
+						targetPlan.Add(op)
+					}
+					if pendingCheckpoint != nil {
+						pendingCheckpoints = append(pendingCheckpoints, *pendingCheckpoint)
+					}
+					continue
+				}
+
+				startPaginationValue, hasStartPaginationValue := initialPaginationValue(opInfo.PaginationSpec)
+				checkpointKey := ""
+				if opInfo.ResourceType == ResourceTypeIncremental {
+					if opInfo.PaginationSpec == nil {
+						return nil, fmt.Errorf("incremental operation %s requires pagination", opInfo.Path)
+					}
+					generatedCheckpointKey, err := buildCheckpointKey("GET", opInfo.Path, baseParams, opInfo.PaginationSpec.ParamName)
+					if err != nil {
+						return nil, fmt.Errorf("build checkpoint key for %s: %w", opInfo.Path, err)
+					}
+					checkpointKey = generatedCheckpointKey
+					checkpoint, err := checkpoints.LoadCheckpoint(ctx, checkpointKey)
+					if err != nil {
+						return nil, fmt.Errorf("load checkpoint for %s: %w", opInfo.Path, err)
+					}
+					if checkpoint != nil {
+						resumeValue, compatible, err := parseResumeCheckpointValue(checkpoint.ResumeValueJSON)
+						if err != nil {
+							return nil, fmt.Errorf("parse checkpoint for %s: %w", opInfo.Path, err)
+						}
+						if compatible {
+							startPaginationValue = resumeValue
+							hasStartPaginationValue = true
+						} else {
+							log.Printf("warning: ignoring checkpoint for %s because it does not match resume-pagination incremental semantics", opInfo.Path)
+						}
 					}
 				}
-				shouldContinue = true
+
+				insertOps, _, lastRequestedValue, hasLastRequestedValue, madeRequest, err := s.fetchAndBuildInsertOps(
+					ctx,
+					baseURL,
+					opInfo.Path,
+					opInfo.Op,
+					requestParams,
+					opInfo.PaginationSpec,
+					workingResponseValues,
+					opInfo.Plan,
+					opInfo.AuthSpecs,
+					startPaginationValue,
+					hasStartPaginationValue,
+				)
+				if err != nil {
+					log.Printf("failed to build INSERT ops for GET %s: %v", opInfo.Path, err)
+					continue
+				}
+				for _, op := range insertOps {
+					targetPlan.Add(op)
+				}
+				if opInfo.ResourceType == ResourceTypeIncremental && madeRequest && hasLastRequestedValue {
+					checkpoint, err := buildCheckpoint("GET", opInfo.Path, baseParams, opInfo.PaginationSpec, checkpointKey, lastRequestedValue)
+					if err != nil {
+						return nil, fmt.Errorf("build checkpoint for %s: %w", opInfo.Path, err)
+					}
+					pendingCheckpoints = append(pendingCheckpoints, checkpoint)
+				}
 			}
 
-			opInfo.IsFetched = true
+			shouldContinue = true
+			fetchedThisCycle[opInfo.Path] = true
 		}
 
 		if !shouldContinue {
@@ -283,16 +405,41 @@ func (s *Service) GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL st
 		}
 	}
 
-	relaxPlanNullability(plan)
-	return plan, nil
-}
+	if len(s.completedOneShotOps) < countOneShotOps(s.operations) {
+		for _, opInfo := range s.operations {
+			if opInfo.ResourceType != ResourceTypeOneShot || s.completedOneShotOps[opInfo.Path] {
+				continue
+			}
+			completedOneShotOps = append(completedOneShotOps, opInfo.Path)
+		}
+	}
 
-func (s *Service) GenerateFullSyncPlan(ctx context.Context, spec *openapi3.T, baseURL string) (*FullSyncPlan, error) {
-	plan, err := s.GeneratePlan(ctx, spec, baseURL)
+	relaxPlanNullability(upsertPlan)
+	relaxPlanNullability(fullReloadPlan)
+	fullSyncPlan, err := buildFullSyncPlan(fullReloadPlan)
 	if err != nil {
 		return nil, err
 	}
-	return buildFullSyncPlan(plan)
+
+	return &CyclePlan{
+		UpsertPlan:          upsertPlan,
+		FullSyncPlan:        fullSyncPlan,
+		PendingCheckpoints:  pendingCheckpoints,
+		nextResponseValues:  workingResponseValues,
+		completedOneShotOps: completedOneShotOps,
+	}, nil
+}
+
+func (s *Service) CommitCycle(plan *CyclePlan) {
+	if plan == nil {
+		return
+	}
+	if plan.nextResponseValues != nil {
+		s.responseValues = cloneInterfaceMap(plan.nextResponseValues)
+	}
+	for _, path := range plan.completedOneShotOps {
+		s.completedOneShotOps[path] = true
+	}
 }
 
 func buildFullSyncPlan(plan *MigrationPlan) (*FullSyncPlan, error) {
@@ -605,34 +752,42 @@ func buildCreateTableOpFromMarkedNode(node *markedNodePlan, relationColumns []Co
 	return op
 }
 
-func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, paginationSpec *ParamDataSpec, fetchedResponseValues map[string][]interface{}, plan *operationExtractionPlan, authSpecs []AuthParamSpec) ([]MigrationOperation, error) {
+func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path string, op *openapi3.Operation, params map[string]string, paginationSpec *ParamDataSpec, fetchedResponseValues map[string][]interface{}, plan *operationExtractionPlan, authSpecs []AuthParamSpec, startPaginationValue interface{}, hasStartPaginationValue bool) ([]MigrationOperation, bool, interface{}, bool, bool, error) {
 	resp := s.getSuccessResponse(op)
 	if resp == nil || resp.Value == nil {
-		return nil, fmt.Errorf("no successful response found")
+		return nil, false, nil, false, false, fmt.Errorf("no successful response found")
 	}
 
 	media := resp.Value.Content.Get("application/json")
 	if media == nil || media.Schema == nil {
-		return nil, fmt.Errorf("no JSON response schema found")
+		return nil, false, nil, false, false, fmt.Errorf("no JSON response schema found")
 	}
 
 	allInsertOps := make([]MigrationOperation, 0)
-	paginationValue, hasPaginationValue := initialPaginationValue(paginationSpec)
+	paginationValue, hasPaginationValue := startPaginationValue, hasStartPaginationValue
+	madeRequest := false
+	lastRequestedValue := paginationValue
+	hasLastRequestedValue := paginationSpec != nil
 
 	for {
 		requestParams := cloneStringMap(params)
 		if paginationSpec != nil && hasPaginationValue {
 			requestParams[paginationSpec.ParamName] = fmt.Sprintf("%v", paginationValue)
 		}
+		if paginationSpec != nil {
+			lastRequestedValue = paginationValue
+			hasLastRequestedValue = true
+		}
 
 		request, err := buildFetchRequest(baseURL, path, op, requestParams, authSpecs)
 		if err != nil {
-			return nil, err
+			return nil, false, nil, false, madeRequest, err
 		}
+		madeRequest = true
 		result, err := s.api.Fetch(ctx, request)
 		if err != nil {
 			log.Printf("warning: failed to fetch data for %s: %v", path, err)
-			return nil, nil
+			return nil, false, nil, false, madeRequest, nil
 		}
 
 		s.extractResponseDataFromData(result.Payload, media, fetchedResponseValues)
@@ -640,7 +795,7 @@ func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path stri
 
 		pageInsertOps, hasRows, err := s.buildInsertOpsForPayload(result.Payload, resp, media, plan)
 		if err != nil {
-			return nil, err
+			return nil, false, nil, false, madeRequest, err
 		}
 		allInsertOps = append(allInsertOps, pageInsertOps...)
 
@@ -652,26 +807,273 @@ func (s *Service) fetchAndBuildInsertOps(ctx context.Context, baseURL, path stri
 		case paramDataTypeCursor:
 			nextValue, ok := extractCursorValue(result.Payload, paginationSpec.CursorPath)
 			if !ok {
-				return allInsertOps, nil
+				return allInsertOps, false, lastRequestedValue, hasLastRequestedValue, madeRequest, nil
+			}
+			if hasPaginationValue && fmt.Sprintf("%v", nextValue) == fmt.Sprintf("%v", paginationValue) {
+				return allInsertOps, false, lastRequestedValue, hasLastRequestedValue, madeRequest, nil
 			}
 			paginationValue = nextValue
 			hasPaginationValue = true
 		case paramDataTypeOffset:
 			if !hasRows {
-				return allInsertOps, nil
+				return allInsertOps, false, lastRequestedValue, hasLastRequestedValue, madeRequest, nil
 			}
 			nextValue, err := incrementOffsetValue(paginationValue, paginationSpec.OffsetConfig.Increment)
 			if err != nil {
-				return nil, fmt.Errorf("%s parameter %s: %w", path, paginationSpec.ParamName, err)
+				return nil, false, nil, false, madeRequest, fmt.Errorf("%s parameter %s: %w", path, paginationSpec.ParamName, err)
 			}
 			paginationValue = nextValue
 			hasPaginationValue = true
 		default:
-			return nil, fmt.Errorf("unsupported pagination type %q", paginationSpec.Type)
+			return nil, false, nil, false, madeRequest, fmt.Errorf("unsupported pagination type %q", paginationSpec.Type)
 		}
 	}
 
-	return allInsertOps, nil
+	return allInsertOps, true, lastRequestedValue, hasLastRequestedValue, madeRequest, nil
+}
+
+func (s *Service) fetchAndBuildHeadWatermarkInsertOps(
+	ctx context.Context,
+	baseURL, path string,
+	op *openapi3.Operation,
+	requestParams map[string]string,
+	checkpointParams map[string]string,
+	paginationSpec *ParamDataSpec,
+	incrementalSpec *IncrementalSpec,
+	fetchedResponseValues map[string][]interface{},
+	plan *operationExtractionPlan,
+	authSpecs []AuthParamSpec,
+	checkpointKey string,
+	checkpoint *Checkpoint,
+) ([]MigrationOperation, *Checkpoint, error) {
+	resp := s.getSuccessResponse(op)
+	if resp == nil || resp.Value == nil {
+		return nil, nil, fmt.Errorf("no successful response found")
+	}
+
+	media := resp.Value.Content.Get("application/json")
+	if media == nil || media.Schema == nil {
+		return nil, nil, fmt.Errorf("no JSON response schema found")
+	}
+
+	var checkpointState *headWatermarkCheckpointState
+	if checkpoint != nil {
+		parsedState, compatible, err := parseHeadWatermarkCheckpoint(checkpoint.ResumeValueJSON)
+		if err != nil {
+			return nil, nil, err
+		}
+		if compatible {
+			checkpointState = parsedState
+		} else {
+			log.Printf("warning: ignoring checkpoint for %s because it does not match head-watermark incremental semantics", path)
+		}
+	}
+
+	allInsertOps := make([]MigrationOperation, 0)
+	startPaginationValue, hasPaginationValue := initialPaginationValue(paginationSpec)
+	paginationValue := startPaginationValue
+	currentCycleState := &headWatermarkCycleState{
+		WatermarkType: incrementalSpec.WatermarkType,
+		BoundaryKeys:  map[string]bool{},
+	}
+
+	for {
+		pageParams := cloneStringMap(requestParams)
+		if hasPaginationValue {
+			pageParams[paginationSpec.ParamName] = fmt.Sprintf("%v", paginationValue)
+		}
+
+		request, err := buildFetchRequest(baseURL, path, op, pageParams, authSpecs)
+		if err != nil {
+			return nil, nil, err
+		}
+		result, err := s.api.Fetch(ctx, request)
+		if err != nil {
+			log.Printf("warning: failed to fetch data for %s: %v", path, err)
+			return nil, nil, nil
+		}
+
+		pageResult, err := filterHeadWatermarkPage(result.Payload, incrementalSpec, checkpointState, currentCycleState)
+		if err != nil {
+			return nil, nil, fmt.Errorf("filter head-watermark page: %w", err)
+		}
+
+		s.extractResponseDataFromData(pageResult.FilteredPayload, media, fetchedResponseValues)
+		s.extractResponseDataFromMarkedData(pageResult.FilteredPayload, media.Schema, fetchedResponseValues)
+
+		pageInsertOps, _, err := s.buildInsertOpsForPayload(pageResult.FilteredPayload, resp, media, plan)
+		if err != nil {
+			return nil, nil, err
+		}
+		allInsertOps = append(allInsertOps, pageInsertOps...)
+
+		if pageResult.RawItemCount == 0 || pageResult.StopAfterPage {
+			break
+		}
+
+		switch paginationSpec.Type {
+		case paramDataTypeCursor:
+			nextValue, ok := extractCursorValue(result.Payload, paginationSpec.CursorPath)
+			if !ok {
+				goto buildCheckpoint
+			}
+			if hasPaginationValue && fmt.Sprintf("%v", nextValue) == fmt.Sprintf("%v", paginationValue) {
+				goto buildCheckpoint
+			}
+			paginationValue = nextValue
+			hasPaginationValue = true
+		case paramDataTypeOffset:
+			nextValue, err := incrementOffsetValue(paginationValue, paginationSpec.OffsetConfig.Increment)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%s parameter %s: %w", path, paginationSpec.ParamName, err)
+			}
+			paginationValue = nextValue
+			hasPaginationValue = true
+		default:
+			return nil, nil, fmt.Errorf("unsupported pagination type %q", paginationSpec.Type)
+		}
+	}
+
+buildCheckpoint:
+	if !currentCycleState.Observed {
+		return allInsertOps, nil, nil
+	}
+	if checkpointState != nil {
+		if currentCycleState.WatermarkType != checkpointState.WatermarkType {
+			log.Printf("warning: ignoring checkpoint advancement for %s because watermark types differ between stored checkpoint and spec", path)
+			return allInsertOps, nil, nil
+		}
+		cmp, err := compareWatermarkValues(currentCycleState.WatermarkType, currentCycleState.MaxWatermark, checkpointState.WatermarkValue)
+		if err != nil {
+			return nil, nil, fmt.Errorf("compare head-watermark checkpoint: %w", err)
+		}
+		if cmp < 0 {
+			log.Printf("warning: keeping existing checkpoint for %s because fetched head watermark moved backwards", path)
+			return allInsertOps, nil, nil
+		}
+	}
+
+	pendingCheckpoint, err := buildHeadWatermarkCheckpoint("GET", path, checkpointParams, paginationSpec, checkpointKey, currentCycleState)
+	if err != nil {
+		return nil, nil, err
+	}
+	return allInsertOps, &pendingCheckpoint, nil
+}
+
+func filterHeadWatermarkPage(payload []byte, spec *IncrementalSpec, checkpoint *headWatermarkCheckpointState, cycleState *headWatermarkCycleState) (*headWatermarkPageResult, error) {
+	var decoded interface{}
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return nil, fmt.Errorf("unmarshal JSON: %w", err)
+	}
+
+	itemsValue := decoded
+	if !spec.ItemsPathIsRoot {
+		itemsValue = resolveByPath(decoded, spec.ItemsPathParts)
+	}
+	rawItems, itemWasObject, err := listHeadWatermarkItems(itemsValue)
+	if err != nil {
+		return nil, err
+	}
+	filteredItems := make([]interface{}, 0, len(rawItems))
+	allOlderThanCheckpoint := checkpoint != nil && len(rawItems) > 0
+
+	for _, rawItem := range rawItems {
+		item, ok := rawItem.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("x-incremental.items-path must resolve to objects")
+		}
+
+		watermarkValue := resolveByPath(item, spec.WatermarkPathParts)
+		if watermarkValue == nil {
+			return nil, fmt.Errorf("missing watermark value at %s", spec.WatermarkPath)
+		}
+		boundaryKey, err := canonicalizeBoundaryKey(item, spec.KeyPathParts)
+		if err != nil {
+			return nil, err
+		}
+		if err := updateHeadWatermarkCycleState(cycleState, spec.WatermarkType, watermarkValue, boundaryKey); err != nil {
+			return nil, err
+		}
+
+		include := true
+		if checkpoint != nil {
+			if checkpoint.WatermarkType != spec.WatermarkType {
+				return nil, fmt.Errorf("stored head-watermark checkpoint type %q does not match operation watermark type %q", checkpoint.WatermarkType, spec.WatermarkType)
+			}
+			cmp, err := compareWatermarkValues(spec.WatermarkType, watermarkValue, checkpoint.WatermarkValue)
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case cmp > 0:
+				allOlderThanCheckpoint = false
+			case cmp == 0:
+				allOlderThanCheckpoint = false
+				include = !checkpoint.BoundaryKeys[boundaryKey]
+			default:
+				include = false
+			}
+		}
+		if include {
+			filteredItems = append(filteredItems, item)
+		}
+	}
+
+	filteredRoot, err := setValueByPath(decoded, spec.ItemsPathParts, spec.ItemsPathIsRoot, filteredItems, itemWasObject)
+	if err != nil {
+		return nil, err
+	}
+	filteredPayload, err := json.Marshal(filteredRoot)
+	if err != nil {
+		return nil, fmt.Errorf("marshal filtered payload: %w", err)
+	}
+
+	return &headWatermarkPageResult{
+		FilteredPayload: filteredPayload,
+		RawItemCount:    len(rawItems),
+		StopAfterPage:   allOlderThanCheckpoint,
+	}, nil
+}
+
+func listHeadWatermarkItems(value interface{}) ([]interface{}, bool, error) {
+	if value == nil {
+		return nil, false, nil
+	}
+	if arrayItems, ok := value.([]interface{}); ok {
+		return arrayItems, false, nil
+	}
+	if objectItem, ok := value.(map[string]interface{}); ok {
+		return []interface{}{objectItem}, true, nil
+	}
+	return nil, false, fmt.Errorf("x-incremental.items-path must resolve to an object or array of objects")
+}
+
+func updateHeadWatermarkCycleState(state *headWatermarkCycleState, watermarkKind watermarkType, watermarkValue interface{}, boundaryKey string) error {
+	if state == nil {
+		return nil
+	}
+	if !state.Observed {
+		state.Observed = true
+		state.WatermarkType = watermarkKind
+		state.MaxWatermark = watermarkValue
+		if state.BoundaryKeys == nil {
+			state.BoundaryKeys = map[string]bool{}
+		}
+		state.BoundaryKeys[boundaryKey] = true
+		return nil
+	}
+	cmp, err := compareWatermarkValues(watermarkKind, watermarkValue, state.MaxWatermark)
+	if err != nil {
+		return err
+	}
+	switch {
+	case cmp > 0:
+		state.MaxWatermark = watermarkValue
+		state.BoundaryKeys = map[string]bool{boundaryKey: true}
+	case cmp == 0:
+		state.BoundaryKeys[boundaryKey] = true
+	}
+	return nil
 }
 
 func buildFetchRequest(baseURL, path string, op *openapi3.Operation, params map[string]string, authSpecs []AuthParamSpec) (FetchRequest, error) {
@@ -731,27 +1133,160 @@ func (s *Service) getSchemaName(schemaRef *openapi3.SchemaRef) string {
 	return schemaName
 }
 
-func (s *Service) collectOperationsWithResType(spec *openapi3.T) []struct {
-	path string
-	op   *openapi3.Operation
-} {
-	var operations []struct {
-		path string
-		op   *openapi3.Operation
+func (s *Service) prepareSpec(spec *openapi3.T) error {
+	if spec == nil {
+		return fmt.Errorf("spec is nil")
 	}
+	if s.compiledSpec == spec && s.operations != nil {
+		return nil
+	}
+
+	operations, err := s.collectOperationsWithResType(spec)
+	if err != nil {
+		return err
+	}
+	tableModes := make(map[string]ResourceType)
+	for _, opInfo := range operations {
+		incrementalSpec, err := s.getIncrementalSpec(opInfo.Path, opInfo.Op, opInfo.ResourceType)
+		if err != nil {
+			return err
+		}
+		paramSpecs, paginationSpec, err := s.getParamDataSpecs(opInfo.Path, opInfo.Op)
+		if err != nil {
+			return fmt.Errorf("parse x-param-data for %s: %w", opInfo.Path, err)
+		}
+		if err := validateResponseDataHints(opInfo.Path, opInfo.Op); err != nil {
+			return err
+		}
+		authSpecs, err := s.getAuthParamSpecs(opInfo.Path, opInfo.Op)
+		if err != nil {
+			return fmt.Errorf("parse x-auth for %s: %w", opInfo.Path, err)
+		}
+		extractionPlan, err := s.buildOperationExtractionPlan(opInfo.Op)
+		if err != nil {
+			return fmt.Errorf("build extraction plan for %s: %w", opInfo.Path, err)
+		}
+		createOps, ownedTables, err := s.buildOperationCreateOps(opInfo.Path, opInfo.Op, extractionPlan)
+		if err != nil {
+			return err
+		}
+		if opInfo.ResourceType == ResourceTypeIncremental && paginationSpec == nil {
+			return fmt.Errorf("incremental operation %s requires cursor or offset pagination", opInfo.Path)
+		}
+		if incrementalSpec != nil && paginationSpec == nil {
+			return fmt.Errorf("head-watermark incremental operation %s requires cursor or offset pagination", opInfo.Path)
+		}
+		if (opInfo.ResourceType == ResourceTypeIncremental || opInfo.ResourceType == ResourceTypeFullReload) && !ownedTablesHavePrimaryKeys(createOps, ownedTables) {
+			return fmt.Errorf("%s requires primary key metadata for owned tables", opInfo.Path)
+		}
+		if incrementalSpec != nil {
+			if err := validateIncrementalSpecAgainstOperation(opInfo.Path, opInfo.Op, incrementalSpec); err != nil {
+				return err
+			}
+		}
+		for _, tableName := range ownedTables {
+			if existingMode, ok := tableModes[tableName]; ok && existingMode != opInfo.ResourceType {
+				return fmt.Errorf("table %s is produced by mixed x-res-type modes: %s and %s", tableName, existingMode, opInfo.ResourceType)
+			}
+			tableModes[tableName] = opInfo.ResourceType
+		}
+
+		opInfo.ParamSpecs = paramSpecs
+		opInfo.PaginationSpec = paginationSpec
+		opInfo.IncrementalSpec = incrementalSpec
+		opInfo.AuthSpecs = authSpecs
+		opInfo.Plan = extractionPlan
+		opInfo.CreateOps = createOps
+		opInfo.OwnedTables = ownedTables
+	}
+
+	s.compiledSpec = spec
+	s.operations = operations
+	return nil
+}
+
+func (s *Service) buildOperationCreateOps(path string, op *openapi3.Operation, extractionPlan *operationExtractionPlan) ([]MigrationOperation, []string, error) {
+	createOps := make([]MigrationOperation, 0)
+	ownedTables := make([]string, 0)
+	generatedTables := make(map[string]bool)
+
+	if extractionPlan != nil && extractionPlan.HasMarks {
+		for _, node := range extractionPlan.Nodes {
+			if generatedTables[node.TableName] {
+				continue
+			}
+			createOps = append(createOps, buildCreateTableOpFromMarkedNode(node, s.getRelationColumnsForNode(extractionPlan, node.Path)))
+			ownedTables = append(ownedTables, node.TableName)
+			generatedTables[node.TableName] = true
+		}
+		for _, rel := range extractionPlan.Relations {
+			if rel.Kind != relationLinkTable || generatedTables[rel.JoinTableName] {
+				continue
+			}
+			createOps = append(createOps, CreateLinkTableOp{
+				TableName:   rel.JoinTableName,
+				LeftColumn:  rel.JoinParentCol,
+				LeftType:    rel.JoinParentType,
+				RightColumn: rel.JoinChildCol,
+				RightType:   rel.JoinChildType,
+				PrimaryKey:  []string{rel.JoinParentCol, rel.JoinChildCol},
+			})
+			ownedTables = append(ownedTables, rel.JoinTableName)
+			generatedTables[rel.JoinTableName] = true
+		}
+		return createOps, ownedTables, nil
+	}
+
+	resp := s.getSuccessResponse(op)
+	if resp == nil || resp.Value == nil {
+		return nil, nil, nil
+	}
+	media := resp.Value.Content.Get("application/json")
+	if media == nil || media.Schema == nil {
+		return nil, nil, nil
+	}
+	schemaName := s.getSchemaName(media.Schema)
+	if schemaName == "" {
+		return nil, nil, nil
+	}
+	createTable, err := buildCreateTableOpFromSchema(media.Schema, schemaName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("build create table for %s: %w", path, err)
+	}
+	return []MigrationOperation{createTable}, []string{schemaName}, nil
+}
+
+func (s *Service) collectOperationsWithResType(spec *openapi3.T) ([]*compiledOperation, error) {
+	var operations []*compiledOperation
 	for path, pathItem := range spec.Paths.Map() {
 		if pathItem == nil || pathItem.Get == nil {
 			continue
 		}
-		if _, ok := pathItem.Get.Extensions["x-res-type"]; ok {
-			operations = append(operations, struct {
-				path string
-				op   *openapi3.Operation
-			}{path: path, op: pathItem.Get})
+		if _, hasIncremental := pathItem.Get.Extensions["x-incremental"]; hasIncremental {
+			rawType, ok := pathItem.Get.Extensions["x-res-type"]
+			if !ok {
+				return nil, fmt.Errorf("%s: x-incremental is allowed only when x-res-type=incremental", path)
+			}
+			resourceType, err := parseResourceType(rawType)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+			if resourceType != ResourceTypeIncremental {
+				return nil, fmt.Errorf("%s: x-incremental is allowed only when x-res-type=incremental", path)
+			}
 		}
+		raw, ok := pathItem.Get.Extensions["x-res-type"]
+		if !ok {
+			continue
+		}
+		resourceType, err := parseResourceType(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		operations = append(operations, &compiledOperation{Path: path, Op: pathItem.Get, ResourceType: resourceType})
 	}
-	sort.Slice(operations, func(i, j int) bool { return operations[i].path < operations[j].path })
-	return operations
+	sort.Slice(operations, func(i, j int) bool { return operations[i].Path < operations[j].Path })
+	return operations, nil
 }
 
 func (s *Service) getParamDataSpecs(opPath string, op *openapi3.Operation) ([]ParamDataSpec, *ParamDataSpec, error) {
@@ -812,6 +1347,24 @@ func (s *Service) getAuthParamSpecs(opPath string, op *openapi3.Operation) ([]Au
 		return specs[i].In < specs[j].In
 	})
 	return specs, nil
+}
+
+func (s *Service) getIncrementalSpec(opPath string, op *openapi3.Operation, resourceType ResourceType) (*IncrementalSpec, error) {
+	if op == nil {
+		return nil, nil
+	}
+	raw, ok := op.Extensions["x-incremental"]
+	if !ok {
+		return nil, nil
+	}
+	if resourceType != ResourceTypeIncremental {
+		return nil, fmt.Errorf("%s: x-incremental is allowed only when x-res-type=incremental", opPath)
+	}
+	spec, err := parseIncrementalSpec(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", opPath, err)
+	}
+	return spec, nil
 }
 
 func (s *Service) buildParamsMapFromSpecs(specs []ParamDataSpec, values []interface{}) map[string]string {
@@ -1084,6 +1637,296 @@ func cloneStringMap(src map[string]string) map[string]string {
 	return dst
 }
 
+func cloneInterfaceMap(src map[string][]interface{}) map[string][]interface{} {
+	if len(src) == 0 {
+		return make(map[string][]interface{})
+	}
+	dst := make(map[string][]interface{}, len(src))
+	for key, values := range src {
+		dst[key] = append([]interface{}{}, values...)
+	}
+	return dst
+}
+
+func mergeCyclePlan(plan *CyclePlan) (*MigrationPlan, error) {
+	merged := &MigrationPlan{}
+	if plan == nil {
+		return merged, nil
+	}
+	if plan.UpsertPlan != nil {
+		for _, op := range plan.UpsertPlan.Operations {
+			merged.Add(op)
+		}
+	}
+	if plan.FullSyncPlan != nil {
+		for _, table := range plan.FullSyncPlan.Tables {
+			columns := append([]Column{}, table.Columns...)
+			merged.Add(CreateTableOp{TableName: table.Name, Columns: columns})
+			merged.Add(InsertRowsOp{TableName: table.Name, Rows: append([]InsertRow{}, table.Rows...)})
+		}
+	}
+	return merged, nil
+}
+
+func countOneShotOps(operations []*compiledOperation) int {
+	count := 0
+	for _, opInfo := range operations {
+		if opInfo.ResourceType == ResourceTypeOneShot {
+			count++
+		}
+	}
+	return count
+}
+
+func parseResourceType(raw interface{}) (ResourceType, error) {
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("x-res-type must be one of %q, %q, %q", ResourceTypeOneShot, ResourceTypeFullReload, ResourceTypeIncremental)
+	}
+	switch ResourceType(strings.ToLower(strings.TrimSpace(value))) {
+	case ResourceTypeOneShot:
+		return ResourceTypeOneShot, nil
+	case ResourceTypeFullReload:
+		return ResourceTypeFullReload, nil
+	case ResourceTypeIncremental:
+		return ResourceTypeIncremental, nil
+	default:
+		return "", fmt.Errorf("unsupported x-res-type %q", value)
+	}
+}
+
+func ownedTablesHavePrimaryKeys(createOps []MigrationOperation, ownedTables []string) bool {
+	if len(ownedTables) == 0 {
+		return true
+	}
+	tablePKs := make(map[string]bool, len(ownedTables))
+	for _, op := range createOps {
+		switch typed := op.(type) {
+		case CreateTableOp:
+			tablePKs[typed.TableName] = len(primaryKeyColumnsFromColumns(typed.Columns)) > 0
+		case *CreateTableOp:
+			tablePKs[typed.TableName] = len(primaryKeyColumnsFromColumns(typed.Columns)) > 0
+		case CreateLinkTableOp:
+			tablePKs[typed.TableName] = len(linkTablePrimaryKeys(typed)) > 0
+		case *CreateLinkTableOp:
+			tablePKs[typed.TableName] = len(linkTablePrimaryKeys(*typed)) > 0
+		}
+	}
+	for _, tableName := range ownedTables {
+		if !tablePKs[tableName] {
+			return false
+		}
+	}
+	return true
+}
+
+func linkTablePrimaryKeys(op CreateLinkTableOp) []string {
+	if len(op.PrimaryKey) > 0 {
+		return append([]string{}, op.PrimaryKey...)
+	}
+	if op.LeftColumn == "" || op.RightColumn == "" {
+		return nil
+	}
+	return []string{op.LeftColumn, op.RightColumn}
+}
+
+type memoryCheckpointStore map[string]Checkpoint
+
+func (m memoryCheckpointStore) Apply(context.Context, *MigrationPlan) (ApplyResult, error) {
+	return ApplyResult{}, nil
+}
+
+func (m memoryCheckpointStore) ApplyFullSync(context.Context, *FullSyncPlan) (ApplyResult, error) {
+	return ApplyResult{}, nil
+}
+
+func (m memoryCheckpointStore) ExportSQL(*MigrationPlan) ([]byte, error) {
+	return nil, nil
+}
+
+func (m memoryCheckpointStore) ExportFullSyncSQL(*FullSyncPlan) ([]byte, error) {
+	return nil, nil
+}
+
+func (m memoryCheckpointStore) LoadCheckpoint(_ context.Context, key string) (*Checkpoint, error) {
+	checkpoint, ok := m[key]
+	if !ok {
+		return nil, nil
+	}
+	copyCheckpoint := checkpoint
+	return &copyCheckpoint, nil
+}
+
+func (m memoryCheckpointStore) SaveCheckpoints(_ context.Context, checkpoints []Checkpoint) error {
+	for _, checkpoint := range checkpoints {
+		m[checkpoint.Key] = checkpoint
+	}
+	return nil
+}
+
+func (m memoryCheckpointStore) Capabilities() Capabilities {
+	return Capabilities{CanExportSQL: true, CanFullSync: true}
+}
+
+func buildCheckpointKey(method, path string, params map[string]string, paginationParam string) (string, error) {
+	paramsJSON, err := serializeCheckpointParams(params)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s|%s|%s|%s", method, path, paginationParam, paramsJSON), nil
+}
+
+func buildCheckpoint(method, path string, params map[string]string, paginationSpec *ParamDataSpec, key string, resumeValue interface{}) (Checkpoint, error) {
+	paramsJSON, err := serializeCheckpointParams(params)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	resumeValueJSON, err := json.Marshal(resumeValue)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	return Checkpoint{
+		Key:             key,
+		OperationPath:   path,
+		Method:          method,
+		ParamsJSON:      paramsJSON,
+		PaginationParam: paginationSpec.ParamName,
+		PaginationType:  string(paginationSpec.Type),
+		ResumeValueJSON: string(resumeValueJSON),
+	}, nil
+}
+
+func buildHeadWatermarkCheckpoint(method, path string, params map[string]string, paginationSpec *ParamDataSpec, key string, state *headWatermarkCycleState) (Checkpoint, error) {
+	if state == nil || !state.Observed {
+		return Checkpoint{}, fmt.Errorf("head-watermark checkpoint state is empty")
+	}
+	paramsJSON, err := serializeCheckpointParams(params)
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	boundaryKeys := sortedBoundaryKeys(state.BoundaryKeys)
+	resumeValueJSON, err := json.Marshal(headWatermarkCheckpointValue{
+		Strategy:       string(incrementalStrategyHeadWatermark),
+		WatermarkType:  string(state.WatermarkType),
+		WatermarkValue: state.MaxWatermark,
+		BoundaryKeys:   boundaryKeys,
+	})
+	if err != nil {
+		return Checkpoint{}, err
+	}
+	return Checkpoint{
+		Key:             key,
+		OperationPath:   path,
+		Method:          method,
+		ParamsJSON:      paramsJSON,
+		PaginationParam: paginationSpec.ParamName,
+		PaginationType:  string(paginationSpec.Type),
+		ResumeValueJSON: string(resumeValueJSON),
+	}, nil
+}
+
+func serializeCheckpointParams(params map[string]string) (string, error) {
+	if len(params) == 0 {
+		return "{}", nil
+	}
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	ordered := make(map[string]string, len(keys))
+	for _, key := range keys {
+		ordered[key] = params[key]
+	}
+	data, err := json.Marshal(ordered)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func parseCheckpointResumeValue(raw string) (interface{}, error) {
+	var value interface{}
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func parseResumeCheckpointValue(raw string) (interface{}, bool, error) {
+	value, err := parseCheckpointResumeValue(raw)
+	if err != nil {
+		return nil, false, err
+	}
+	if value == nil {
+		return nil, true, nil
+	}
+	if _, ok := value.(map[string]interface{}); ok {
+		return nil, false, nil
+	}
+	return value, true, nil
+}
+
+func parseHeadWatermarkCheckpoint(raw string) (*headWatermarkCheckpointState, bool, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, true, nil
+	}
+	var value interface{}
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return nil, false, err
+	}
+	m, ok := value.(map[string]interface{})
+	if !ok {
+		return nil, false, nil
+	}
+	strategyValue, ok := m["strategy"].(string)
+	if !ok || strings.TrimSpace(strategyValue) == "" {
+		return nil, false, nil
+	}
+	if incrementalStrategy(strings.ToLower(strings.TrimSpace(strategyValue))) != incrementalStrategyHeadWatermark {
+		return nil, false, nil
+	}
+	watermarkTypeValue, ok := m["watermark_type"].(string)
+	if !ok || strings.TrimSpace(watermarkTypeValue) == "" {
+		return nil, false, fmt.Errorf("head-watermark checkpoint watermark_type is required")
+	}
+	var normalizedType watermarkType
+	switch watermarkType(strings.ToLower(strings.TrimSpace(watermarkTypeValue))) {
+	case watermarkTypeNumber:
+		normalizedType = watermarkTypeNumber
+	case watermarkTypeString:
+		normalizedType = watermarkTypeString
+	case watermarkTypeDateTime:
+		normalizedType = watermarkTypeDateTime
+	default:
+		return nil, false, fmt.Errorf("unsupported head-watermark checkpoint watermark_type %q", watermarkTypeValue)
+	}
+	state := &headWatermarkCheckpointState{
+		WatermarkType:  normalizedType,
+		WatermarkValue: m["watermark_value"],
+		BoundaryKeys:   map[string]bool{},
+	}
+	boundaryRaw, ok := m["boundary_keys"]
+	if !ok {
+		return state, true, nil
+	}
+	boundaryList, ok := boundaryRaw.([]interface{})
+	if !ok {
+		return nil, false, fmt.Errorf("head-watermark checkpoint boundary_keys must be array")
+	}
+	for _, item := range boundaryList {
+		boundaryKey, ok := item.(string)
+		if !ok {
+			return nil, false, fmt.Errorf("head-watermark checkpoint boundary_keys entries must be strings")
+		}
+		state.BoundaryKeys[boundaryKey] = true
+	}
+	return state, true, nil
+}
+
 func (s *Service) buildEffectiveParamValues(opPath string, spec ParamDataSpec, fetchedResponseValues map[string][]interface{}) ([]interface{}, bool, error) {
 	switch spec.Type {
 	case paramDataTypeOperation:
@@ -1237,6 +2080,162 @@ func validateResponseDataHints(opPath string, op *openapi3.Operation) error {
 		return nil
 	}
 	return walk(media.Schema.Value)
+}
+
+func parseIncrementalSpec(raw interface{}) (*IncrementalSpec, error) {
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("x-incremental must be object")
+	}
+
+	strategyRaw, ok := m["strategy"]
+	if !ok {
+		return nil, fmt.Errorf("x-incremental.strategy is required")
+	}
+	strategyValue, ok := strategyRaw.(string)
+	if !ok || strings.TrimSpace(strategyValue) == "" {
+		return nil, fmt.Errorf("x-incremental.strategy must be non-empty string")
+	}
+
+	spec := &IncrementalSpec{}
+	switch incrementalStrategy(strings.ToLower(strings.TrimSpace(strategyValue))) {
+	case incrementalStrategyHeadWatermark:
+		spec.Strategy = incrementalStrategyHeadWatermark
+	default:
+		return nil, fmt.Errorf("unsupported x-incremental.strategy %q", strategyValue)
+	}
+
+	itemsPathRaw, ok := m["items-path"]
+	if !ok {
+		return nil, fmt.Errorf("x-incremental.items-path is required")
+	}
+	itemsPath, ok := itemsPathRaw.(string)
+	if !ok || strings.TrimSpace(itemsPath) == "" {
+		return nil, fmt.Errorf("x-incremental.items-path must be non-empty string")
+	}
+	itemsPathParts, isRoot, err := parseItemsPath(itemsPath)
+	if err != nil {
+		return nil, err
+	}
+	spec.ItemsPath = strings.TrimSpace(itemsPath)
+	spec.ItemsPathParts = itemsPathParts
+	spec.ItemsPathIsRoot = isRoot
+
+	watermarkRaw, ok := m["watermark"]
+	if !ok {
+		return nil, fmt.Errorf("x-incremental.watermark is required")
+	}
+	watermarkMap, ok := watermarkRaw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("x-incremental.watermark must be object")
+	}
+	watermarkPathRaw, ok := watermarkMap["path"]
+	if !ok {
+		return nil, fmt.Errorf("x-incremental.watermark.path is required")
+	}
+	watermarkPath, ok := watermarkPathRaw.(string)
+	if !ok || strings.TrimSpace(watermarkPath) == "" {
+		return nil, fmt.Errorf("x-incremental.watermark.path must be non-empty string")
+	}
+	watermarkPathParts, err := parseDotPath(watermarkPath, "x-incremental.watermark.path")
+	if err != nil {
+		return nil, err
+	}
+	spec.WatermarkPath = strings.TrimSpace(watermarkPath)
+	spec.WatermarkPathParts = watermarkPathParts
+
+	watermarkTypeRaw, ok := watermarkMap["type"]
+	if !ok {
+		return nil, fmt.Errorf("x-incremental.watermark.type is required")
+	}
+	watermarkTypeValue, ok := watermarkTypeRaw.(string)
+	if !ok || strings.TrimSpace(watermarkTypeValue) == "" {
+		return nil, fmt.Errorf("x-incremental.watermark.type must be non-empty string")
+	}
+	switch watermarkType(strings.ToLower(strings.TrimSpace(watermarkTypeValue))) {
+	case watermarkTypeNumber:
+		spec.WatermarkType = watermarkTypeNumber
+	case watermarkTypeString:
+		spec.WatermarkType = watermarkTypeString
+	case watermarkTypeDateTime:
+		spec.WatermarkType = watermarkTypeDateTime
+	default:
+		return nil, fmt.Errorf("x-incremental.watermark.type must be one of %q, %q, %q", watermarkTypeNumber, watermarkTypeString, watermarkTypeDateTime)
+	}
+
+	keyPathsRaw, ok := m["key-paths"]
+	if !ok {
+		return nil, fmt.Errorf("x-incremental.key-paths is required")
+	}
+	keyPathList, ok := keyPathsRaw.([]interface{})
+	if !ok || len(keyPathList) == 0 {
+		return nil, fmt.Errorf("x-incremental.key-paths must be non-empty array")
+	}
+	seen := make(map[string]bool, len(keyPathList))
+	for _, rawKeyPath := range keyPathList {
+		keyPath, ok := rawKeyPath.(string)
+		if !ok || strings.TrimSpace(keyPath) == "" {
+			return nil, fmt.Errorf("x-incremental.key-paths entries must be non-empty strings")
+		}
+		normalized := strings.TrimSpace(keyPath)
+		if seen[normalized] {
+			return nil, fmt.Errorf("x-incremental.key-paths must not contain duplicates")
+		}
+		seen[normalized] = true
+		keyPathParts, err := parseDotPath(normalized, "x-incremental.key-paths")
+		if err != nil {
+			return nil, err
+		}
+		spec.KeyPaths = append(spec.KeyPaths, normalized)
+		spec.KeyPathParts = append(spec.KeyPathParts, keyPathParts)
+	}
+
+	return spec, nil
+}
+
+func validateIncrementalSpecAgainstOperation(opPath string, op *openapi3.Operation, spec *IncrementalSpec) error {
+	if spec == nil {
+		return nil
+	}
+	resp := (&Service{}).getSuccessResponse(op)
+	if resp == nil || resp.Value == nil {
+		return fmt.Errorf("%s: x-incremental requires a successful JSON response schema", opPath)
+	}
+	media := resp.Value.Content.Get("application/json")
+	if media == nil || media.Schema == nil || media.Schema.Value == nil {
+		return fmt.Errorf("%s: x-incremental requires a successful JSON response schema", opPath)
+	}
+
+	itemsSchema := media.Schema
+	var err error
+	if !spec.ItemsPathIsRoot {
+		itemsSchema, err = resolveSchemaPath(media.Schema, spec.ItemsPathParts)
+		if err != nil {
+			return fmt.Errorf("%s: invalid x-incremental.items-path: %w", opPath, err)
+		}
+	}
+	itemSchema := itemsSchema.Value
+	if itemSchema == nil {
+		return fmt.Errorf("%s: invalid x-incremental.items-path", opPath)
+	}
+	if itemSchema.Type != nil && itemSchema.Type.Is("array") {
+		if itemSchema.Items == nil || itemSchema.Items.Value == nil {
+			return fmt.Errorf("%s: x-incremental.items-path must resolve to an array with item schema", opPath)
+		}
+		itemSchema = itemSchema.Items.Value
+	}
+	if itemSchema.Type == nil || !itemSchema.Type.Is("object") {
+		return fmt.Errorf("%s: x-incremental.items-path must resolve to object items", opPath)
+	}
+	if _, err := resolveSchemaPath(&openapi3.SchemaRef{Value: itemSchema}, spec.WatermarkPathParts); err != nil {
+		return fmt.Errorf("%s: invalid x-incremental.watermark.path: %w", opPath, err)
+	}
+	for _, keyPathParts := range spec.KeyPathParts {
+		if _, err := resolveSchemaPath(&openapi3.SchemaRef{Value: itemSchema}, keyPathParts); err != nil {
+			return fmt.Errorf("%s: invalid x-incremental.key-paths: %w", opPath, err)
+		}
+	}
+	return nil
 }
 
 func parseParamDataSpec(raw interface{}, paramName string) (ParamDataSpec, error) {
@@ -1974,6 +2973,177 @@ func resolveByPath(root interface{}, path []string) interface{} {
 		cur = val
 	}
 	return cur
+}
+
+func setValueByPath(root interface{}, path []string, isRoot bool, filteredItems []interface{}, itemWasObject bool) (interface{}, error) {
+	if isRoot {
+		if itemWasObject {
+			if len(filteredItems) == 0 {
+				return nil, nil
+			}
+			return filteredItems[0], nil
+		}
+		return filteredItems, nil
+	}
+	if len(path) == 0 {
+		return nil, fmt.Errorf("path is required")
+	}
+	parentPath := path[:len(path)-1]
+	parentValue := resolveByPath(root, parentPath)
+	parentObject, ok := parentValue.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("x-incremental.items-path parent must resolve to object")
+	}
+	if itemWasObject {
+		if len(filteredItems) == 0 {
+			parentObject[path[len(path)-1]] = nil
+			return root, nil
+		}
+		parentObject[path[len(path)-1]] = filteredItems[0]
+		return root, nil
+	}
+	parentObject[path[len(path)-1]] = filteredItems
+	return root, nil
+}
+
+func parseItemsPath(raw string) ([]string, bool, error) {
+	normalized := strings.TrimSpace(raw)
+	if normalized == "$" {
+		return nil, true, nil
+	}
+	parts, err := parseDotPath(normalized, "x-incremental.items-path")
+	if err != nil {
+		return nil, false, err
+	}
+	return parts, false, nil
+}
+
+func parseDotPath(raw, field string) ([]string, error) {
+	parts := strings.Split(strings.TrimSpace(raw), ".")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("%s must be a dot-delimited path with non-empty segments", field)
+		}
+		result = append(result, part)
+	}
+	return result, nil
+}
+
+func resolveSchemaPath(schemaRef *openapi3.SchemaRef, path []string) (*openapi3.SchemaRef, error) {
+	current := schemaRef
+	if current == nil || current.Value == nil {
+		return nil, fmt.Errorf("schema is nil")
+	}
+	for _, step := range path {
+		for current != nil && current.Value != nil && current.Value.Type != nil && current.Value.Type.Is("array") {
+			current = current.Value.Items
+		}
+		if current == nil || current.Value == nil {
+			return nil, fmt.Errorf("schema is nil")
+		}
+		if current.Value.Type == nil || !current.Value.Type.Is("object") {
+			return nil, fmt.Errorf("segment %q is not reachable through object properties", step)
+		}
+		next, ok := current.Value.Properties[step]
+		if !ok || next == nil || next.Value == nil {
+			return nil, fmt.Errorf("segment %q not found", step)
+		}
+		current = next
+	}
+	return current, nil
+}
+
+func canonicalizeBoundaryKey(item map[string]interface{}, keyPathParts [][]string) (string, error) {
+	values := make([]interface{}, 0, len(keyPathParts))
+	for _, keyPath := range keyPathParts {
+		value := resolveByPath(item, keyPath)
+		if value == nil {
+			return "", fmt.Errorf("missing boundary key value at %s", strings.Join(keyPath, "."))
+		}
+		values = append(values, value)
+	}
+	data, err := json.Marshal(values)
+	if err != nil {
+		return "", fmt.Errorf("marshal boundary key: %w", err)
+	}
+	return string(data), nil
+}
+
+func compareWatermarkValues(kind watermarkType, left, right interface{}) (int, error) {
+	switch kind {
+	case watermarkTypeNumber:
+		leftValue, ok := toNumber(left)
+		if !ok {
+			return 0, fmt.Errorf("watermark value %v must be numeric", left)
+		}
+		rightValue, ok := toNumber(right)
+		if !ok {
+			return 0, fmt.Errorf("watermark value %v must be numeric", right)
+		}
+		switch {
+		case leftValue < rightValue:
+			return -1, nil
+		case leftValue > rightValue:
+			return 1, nil
+		default:
+			return 0, nil
+		}
+	case watermarkTypeString:
+		leftValue, ok := left.(string)
+		if !ok {
+			return 0, fmt.Errorf("watermark value %v must be string", left)
+		}
+		rightValue, ok := right.(string)
+		if !ok {
+			return 0, fmt.Errorf("watermark value %v must be string", right)
+		}
+		switch {
+		case leftValue < rightValue:
+			return -1, nil
+		case leftValue > rightValue:
+			return 1, nil
+		default:
+			return 0, nil
+		}
+	case watermarkTypeDateTime:
+		leftRaw, ok := left.(string)
+		if !ok {
+			return 0, fmt.Errorf("watermark value %v must be RFC3339 string", left)
+		}
+		rightRaw, ok := right.(string)
+		if !ok {
+			return 0, fmt.Errorf("watermark value %v must be RFC3339 string", right)
+		}
+		leftValue, err := time.Parse(time.RFC3339, leftRaw)
+		if err != nil {
+			return 0, fmt.Errorf("parse watermark %q: %w", leftRaw, err)
+		}
+		rightValue, err := time.Parse(time.RFC3339, rightRaw)
+		if err != nil {
+			return 0, fmt.Errorf("parse watermark %q: %w", rightRaw, err)
+		}
+		switch {
+		case leftValue.Before(rightValue):
+			return -1, nil
+		case leftValue.After(rightValue):
+			return 1, nil
+		default:
+			return 0, nil
+		}
+	default:
+		return 0, fmt.Errorf("unsupported watermark type %q", kind)
+	}
+}
+
+func sortedBoundaryKeys(boundaryKeys map[string]bool) []string {
+	keys := make([]string, 0, len(boundaryKeys))
+	for key := range boundaryKeys {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 type markedInsertContext struct {

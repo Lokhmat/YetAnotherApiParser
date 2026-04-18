@@ -571,6 +571,502 @@ func TestGeneratePlanCursorPagination(t *testing.T) {
 	}
 }
 
+func TestGenerateCyclePlanOneShotSkipsAfterCommit(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/items": func(req FetchRequest) ([]byte, error) {
+				return []byte(`[{"id":1,"name":"first"}]`), nil
+			},
+		},
+	}
+
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/items", &openapi3.PathItem{
+				Get: &openapi3.Operation{
+					Extensions: map[string]any{"x-res-type": "one-shot"},
+					Responses: responseWithJSONSchema("#/components/schemas/items", openapi3.NewArraySchema().WithItems(
+						openapi3.NewObjectSchema().
+							WithProperty("id", withPK(openapi3.NewIntegerSchema())).
+							WithProperty("name", openapi3.NewStringSchema()),
+					)),
+				},
+			}),
+		),
+	}
+
+	service := NewService(api)
+	store := memoryCheckpointStore{}
+
+	firstPlan, err := service.GenerateCyclePlan(context.Background(), spec, "https://example.com", store)
+	if err != nil {
+		t.Fatalf("GenerateCyclePlan returned error: %v", err)
+	}
+	if len(api.requests["/items"]) != 1 {
+		t.Fatalf("expected one fetch during first cycle, got %d", len(api.requests["/items"]))
+	}
+
+	service.CommitCycle(firstPlan)
+
+	secondPlan, err := service.GenerateCyclePlan(context.Background(), spec, "https://example.com", store)
+	if err != nil {
+		t.Fatalf("GenerateCyclePlan second cycle returned error: %v", err)
+	}
+	if len(api.requests["/items"]) != 1 {
+		t.Fatalf("expected one-shot operation to be skipped after commit, got %d requests", len(api.requests["/items"]))
+	}
+	if secondPlan.UpsertPlan == nil || len(secondPlan.UpsertPlan.Operations) != 0 {
+		t.Fatalf("expected empty upsert plan after one-shot commit, got %+v", secondPlan.UpsertPlan)
+	}
+}
+
+func TestGenerateCyclePlanIncrementalUsesCheckpoint(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/events": func(req FetchRequest) ([]byte, error) {
+				if req.QueryParams["cursor"] != "saved-token" {
+					return nil, fmt.Errorf("unexpected cursor %q", req.QueryParams["cursor"])
+				}
+				return []byte(`{"id":2,"next":{"cursor":""}}`), nil
+			},
+		},
+	}
+
+	cursorParam := openapi3.NewQueryParameter("cursor").WithSchema(openapi3.NewStringSchema())
+	cursorParam.Extensions = map[string]any{"x-param-data": map[string]any{"type": "cursor", "cursor": "next.cursor"}}
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/events", &openapi3.PathItem{
+				Get: &openapi3.Operation{
+					Extensions: map[string]any{"x-res-type": "incremental"},
+					Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: cursorParam}},
+					Responses: responseWithJSONSchema("#/components/schemas/events", openapi3.NewObjectSchema().
+						WithProperty("id", withPK(openapi3.NewIntegerSchema())).
+						WithProperty("next", openapi3.NewObjectSchema().WithProperty("cursor", openapi3.NewStringSchema())),
+					),
+				},
+			}),
+		),
+	}
+
+	service := NewService(api)
+	store := memoryCheckpointStore{}
+	key, err := buildCheckpointKey("GET", "/events", map[string]string{}, "cursor")
+	if err != nil {
+		t.Fatalf("buildCheckpointKey returned error: %v", err)
+	}
+	checkpoint, err := buildCheckpoint("GET", "/events", map[string]string{}, &ParamDataSpec{ParamName: "cursor", Type: paramDataTypeCursor}, key, "saved-token")
+	if err != nil {
+		t.Fatalf("buildCheckpoint returned error: %v", err)
+	}
+	store[checkpoint.Key] = checkpoint
+
+	plan, err := service.GenerateCyclePlan(context.Background(), spec, "https://example.com", store)
+	if err != nil {
+		t.Fatalf("GenerateCyclePlan returned error: %v", err)
+	}
+	if len(api.requests["/events"]) != 1 {
+		t.Fatalf("expected one incremental request, got %d", len(api.requests["/events"]))
+	}
+	if api.requests["/events"][0].QueryParams["cursor"] != "saved-token" {
+		t.Fatalf("expected checkpoint cursor to be used, got %+v", api.requests["/events"][0].QueryParams)
+	}
+	if len(plan.PendingCheckpoints) != 1 || plan.PendingCheckpoints[0].Key != key {
+		t.Fatalf("expected one staged checkpoint for %s, got %+v", key, plan.PendingCheckpoints)
+	}
+}
+
+func TestGenerateCyclePlanHeadWatermarkStagesCheckpointFromFullFetch(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/events": func(req FetchRequest) ([]byte, error) {
+				switch req.QueryParams["cursor"] {
+				case "":
+					return []byte(`{
+						"data":{"items":[
+							{"id":3,"updated_at":"2026-04-03T00:00:00Z","value":"three"},
+							{"id":2,"updated_at":"2026-04-03T00:00:00Z","value":"two"}
+						]},
+						"page":{"next_cursor":"c1"}
+					}`), nil
+				case "c1":
+					return []byte(`{
+						"data":{"items":[
+							{"id":1,"updated_at":"2026-04-02T00:00:00Z","value":"one"}
+						]},
+						"page":{"next_cursor":""}
+					}`), nil
+				default:
+					return nil, fmt.Errorf("unexpected cursor %q", req.QueryParams["cursor"])
+				}
+			},
+		},
+	}
+
+	service := NewService(api)
+	plan, err := service.GenerateCyclePlan(context.Background(), headWatermarkMarkedSpec(false, false), "https://example.com", memoryCheckpointStore{})
+	if err != nil {
+		t.Fatalf("GenerateCyclePlan returned error: %v", err)
+	}
+	if len(api.requests["/events"]) != 2 {
+		t.Fatalf("expected 2 paginated requests, got %d", len(api.requests["/events"]))
+	}
+	if got := insertedPrimaryKeysForTable(plan.UpsertPlan, "events", "id"); !slices.Equal(got, []string{"1", "2", "3"}) {
+		t.Fatalf("unexpected inserted ids: %v", got)
+	}
+	if len(plan.PendingCheckpoints) != 1 {
+		t.Fatalf("expected one pending checkpoint, got %+v", plan.PendingCheckpoints)
+	}
+	checkpointState, compatible, err := parseHeadWatermarkCheckpoint(plan.PendingCheckpoints[0].ResumeValueJSON)
+	if err != nil {
+		t.Fatalf("parseHeadWatermarkCheckpoint returned error: %v", err)
+	}
+	if !compatible || checkpointState == nil {
+		t.Fatalf("expected head-watermark checkpoint, got compatible=%v state=%+v", compatible, checkpointState)
+	}
+	if watermark, ok := checkpointState.WatermarkValue.(string); !ok || watermark != "2026-04-03T00:00:00Z" {
+		t.Fatalf("unexpected watermark value: %+v", checkpointState)
+	}
+	if got := sortedBoundaryKeys(checkpointState.BoundaryKeys); !slices.Equal(got, []string{"[2]", "[3]"}) {
+		t.Fatalf("unexpected boundary keys: %v", got)
+	}
+}
+
+func TestGenerateCyclePlanHeadWatermarkUsesBoundaryKeysAndRestartsFromHead(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/events": func(req FetchRequest) ([]byte, error) {
+				switch req.QueryParams["cursor"] {
+				case "":
+					return []byte(`{
+						"data":{"items":[
+							{"id":4,"updated_at":"2026-04-03T00:00:00Z","value":"new-equal"},
+							{"id":2,"updated_at":"2026-04-03T00:00:00Z","value":"old-equal"}
+						]},
+						"page":{"next_cursor":"c1"}
+					}`), nil
+				case "c1":
+					return []byte(`{
+						"data":{"items":[
+							{"id":1,"updated_at":"2026-04-02T00:00:00Z","value":"old"}
+						]},
+						"page":{"next_cursor":""}
+					}`), nil
+				default:
+					return nil, fmt.Errorf("unexpected cursor %q", req.QueryParams["cursor"])
+				}
+			},
+		},
+	}
+
+	service := NewService(api)
+	store := memoryCheckpointStore{}
+	key, err := buildCheckpointKey("GET", "/events", map[string]string{}, "cursor")
+	if err != nil {
+		t.Fatalf("buildCheckpointKey returned error: %v", err)
+	}
+	checkpoint, err := buildHeadWatermarkCheckpoint("GET", "/events", map[string]string{}, &ParamDataSpec{ParamName: "cursor", Type: paramDataTypeCursor}, key, &headWatermarkCycleState{
+		Observed:      true,
+		WatermarkType: watermarkTypeDateTime,
+		MaxWatermark:  "2026-04-03T00:00:00Z",
+		BoundaryKeys:  map[string]bool{"[2]": true},
+	})
+	if err != nil {
+		t.Fatalf("buildHeadWatermarkCheckpoint returned error: %v", err)
+	}
+	store[key] = checkpoint
+
+	plan, err := service.GenerateCyclePlan(context.Background(), headWatermarkMarkedSpec(false, false), "https://example.com", store)
+	if err != nil {
+		t.Fatalf("GenerateCyclePlan returned error: %v", err)
+	}
+	if len(api.requests["/events"]) != 2 {
+		t.Fatalf("expected 2 paginated requests, got %d", len(api.requests["/events"]))
+	}
+	if _, ok := api.requests["/events"][0].QueryParams["cursor"]; ok {
+		t.Fatalf("expected first request to restart from head, got %+v", api.requests["/events"][0].QueryParams)
+	}
+	if got := insertedPrimaryKeysForTable(plan.UpsertPlan, "events", "id"); !slices.Equal(got, []string{"4"}) {
+		t.Fatalf("expected only unseen equal-watermark row to be inserted, got %v", got)
+	}
+	if len(plan.PendingCheckpoints) != 1 {
+		t.Fatalf("expected one pending checkpoint, got %+v", plan.PendingCheckpoints)
+	}
+	checkpointState, compatible, err := parseHeadWatermarkCheckpoint(plan.PendingCheckpoints[0].ResumeValueJSON)
+	if err != nil {
+		t.Fatalf("parseHeadWatermarkCheckpoint returned error: %v", err)
+	}
+	if !compatible || checkpointState == nil {
+		t.Fatalf("expected head-watermark checkpoint, got compatible=%v state=%+v", compatible, checkpointState)
+	}
+	if got := sortedBoundaryKeys(checkpointState.BoundaryKeys); !slices.Equal(got, []string{"[2]", "[4]"}) {
+		t.Fatalf("unexpected boundary keys: %v", got)
+	}
+}
+
+func TestGenerateCyclePlanHeadWatermarkPublishesOnlyFilteredDependencyValues(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/details": func(req FetchRequest) ([]byte, error) {
+				switch req.QueryParams["eventId"] {
+				case "4":
+					return []byte(`[{"id":400}]`), nil
+				default:
+					return nil, fmt.Errorf("unexpected eventId %q", req.QueryParams["eventId"])
+				}
+			},
+			"/events": func(req FetchRequest) ([]byte, error) {
+				switch req.QueryParams["cursor"] {
+				case "":
+					return []byte(`{
+						"data":{"items":[
+							{"id":4,"updated_at":"2026-04-03T00:00:00Z","value":"new-equal"},
+							{"id":2,"updated_at":"2026-04-03T00:00:00Z","value":"old-equal"}
+						]},
+						"page":{"next_cursor":"c1"}
+					}`), nil
+				case "c1":
+					return []byte(`{
+						"data":{"items":[
+							{"id":1,"updated_at":"2026-04-02T00:00:00Z","value":"old"}
+						]},
+						"page":{"next_cursor":""}
+					}`), nil
+				default:
+					return nil, fmt.Errorf("unexpected cursor %q", req.QueryParams["cursor"])
+				}
+			},
+		},
+	}
+
+	service := NewService(api)
+	store := memoryCheckpointStore{}
+	key, err := buildCheckpointKey("GET", "/events", map[string]string{}, "cursor")
+	if err != nil {
+		t.Fatalf("buildCheckpointKey returned error: %v", err)
+	}
+	checkpoint, err := buildHeadWatermarkCheckpoint("GET", "/events", map[string]string{}, &ParamDataSpec{ParamName: "cursor", Type: paramDataTypeCursor}, key, &headWatermarkCycleState{
+		Observed:      true,
+		WatermarkType: watermarkTypeDateTime,
+		MaxWatermark:  "2026-04-03T00:00:00Z",
+		BoundaryKeys:  map[string]bool{"[2]": true},
+	})
+	if err != nil {
+		t.Fatalf("buildHeadWatermarkCheckpoint returned error: %v", err)
+	}
+	store[key] = checkpoint
+
+	_, err = service.GenerateCyclePlan(context.Background(), headWatermarkMarkedSpec(true, false), "https://example.com", store)
+	if err != nil {
+		t.Fatalf("GenerateCyclePlan returned error: %v", err)
+	}
+	if len(api.requests["/details"]) != 1 {
+		t.Fatalf("expected one downstream request, got %d", len(api.requests["/details"]))
+	}
+	if api.requests["/details"][0].QueryParams["eventId"] != "4" {
+		t.Fatalf("expected only filtered id to be published, got %+v", api.requests["/details"][0].QueryParams)
+	}
+}
+
+func TestGenerateCyclePlanRejectsHeadWatermarkOnNonIncrementalOperation(t *testing.T) {
+	service := NewService(&fakeAPIConnector{})
+	_, err := service.GenerateCyclePlan(context.Background(), headWatermarkMarkedSpec(false, true), "https://example.com", memoryCheckpointStore{})
+	if err == nil || !strings.Contains(err.Error(), "x-incremental is allowed only when x-res-type=incremental") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGenerateCyclePlanRejectsHeadWatermarkWithInvalidItemsPath(t *testing.T) {
+	service := NewService(&fakeAPIConnector{})
+	_, err := service.GenerateCyclePlan(context.Background(), headWatermarkMarkedSpec(false, false, map[string]any{
+		"strategy":   "head-watermark",
+		"items-path": "data.missing",
+		"watermark": map[string]any{
+			"path": "updated_at",
+			"type": "datetime",
+		},
+		"key-paths": []any{"id"},
+	}), "https://example.com", memoryCheckpointStore{})
+	if err == nil || !strings.Contains(err.Error(), "invalid x-incremental.items-path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGenerateCyclePlanHeadWatermarkIgnoresLegacyCheckpointShape(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/events": func(req FetchRequest) ([]byte, error) {
+				switch req.QueryParams["cursor"] {
+				case "":
+					return []byte(`{
+						"data":{"items":[
+							{"id":3,"updated_at":"2026-04-03T00:00:00Z","value":"three"}
+						]},
+						"page":{"next_cursor":"c1"}
+					}`), nil
+				case "c1":
+					return []byte(`{
+						"data":{"items":[]},
+						"page":{"next_cursor":""}
+					}`), nil
+				default:
+					return nil, fmt.Errorf("unexpected cursor %q", req.QueryParams["cursor"])
+				}
+			},
+		},
+	}
+
+	service := NewService(api)
+	store := memoryCheckpointStore{}
+	key, err := buildCheckpointKey("GET", "/events", map[string]string{}, "cursor")
+	if err != nil {
+		t.Fatalf("buildCheckpointKey returned error: %v", err)
+	}
+	legacyCheckpoint, err := buildCheckpoint("GET", "/events", map[string]string{}, &ParamDataSpec{ParamName: "cursor", Type: paramDataTypeCursor}, key, "saved-token")
+	if err != nil {
+		t.Fatalf("buildCheckpoint returned error: %v", err)
+	}
+	store[key] = legacyCheckpoint
+
+	_, err = service.GenerateCyclePlan(context.Background(), headWatermarkMarkedSpec(false, false), "https://example.com", store)
+	if err != nil {
+		t.Fatalf("GenerateCyclePlan returned error: %v", err)
+	}
+	if len(api.requests["/events"]) == 0 {
+		t.Fatalf("expected requests to be made")
+	}
+	if _, ok := api.requests["/events"][0].QueryParams["cursor"]; ok {
+		t.Fatalf("expected legacy checkpoint to be ignored for head-watermark mode, got %+v", api.requests["/events"][0].QueryParams)
+	}
+}
+
+func TestGenerateCyclePlanHeadWatermarkSupportsRootArrayItemsPath(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/commits": func(req FetchRequest) ([]byte, error) {
+				switch req.QueryParams["page"] {
+				case "1":
+					return []byte(`[
+							{"sha":"a1","node_id":"n1","commit":{"url":"u1","author":{"date":"2026-04-03T00:00:00Z"}}},
+							{"sha":"a2","node_id":"n2","commit":{"url":"u2","author":{"date":"2026-04-03T00:00:00Z"}}}
+						]`), nil
+				case "2":
+					return []byte(`[
+						{"sha":"a0","node_id":"n0","commit":{"url":"u0","author":{"date":"2026-04-02T00:00:00Z"}}}
+					]`), nil
+				case "3":
+					return []byte(`[]`), nil
+				default:
+					return nil, fmt.Errorf("unexpected page %q", req.QueryParams["page"])
+				}
+			},
+		},
+	}
+
+	service := NewService(api)
+	plan, err := service.GenerateCyclePlan(context.Background(), headWatermarkRootArraySpec(), "https://example.com", memoryCheckpointStore{})
+	if err != nil {
+		t.Fatalf("GenerateCyclePlan returned error: %v", err)
+	}
+	if len(api.requests["/commits"]) != 3 {
+		t.Fatalf("expected 3 paginated requests including final empty page, got %d", len(api.requests["/commits"]))
+	}
+	if got := insertedPrimaryKeysForTable(plan.UpsertPlan, "commit_outer", "sha"); !slices.Equal(got, []string{"a0", "a1", "a2"}) {
+		t.Fatalf("unexpected inserted shas: %v", got)
+	}
+	if len(plan.PendingCheckpoints) != 1 {
+		t.Fatalf("expected one pending checkpoint, got %+v", plan.PendingCheckpoints)
+	}
+	checkpointState, compatible, err := parseHeadWatermarkCheckpoint(plan.PendingCheckpoints[0].ResumeValueJSON)
+	if err != nil {
+		t.Fatalf("parseHeadWatermarkCheckpoint returned error: %v", err)
+	}
+	if !compatible || checkpointState == nil {
+		t.Fatalf("expected head-watermark checkpoint, got compatible=%v state=%+v", compatible, checkpointState)
+	}
+	if got := sortedBoundaryKeys(checkpointState.BoundaryKeys); !slices.Equal(got, []string{"[\"n1\"]", "[\"n2\"]"}) {
+		t.Fatalf("unexpected boundary keys: %v", got)
+	}
+}
+
+func TestGenerateCyclePlanRejectsRootArrayWatermarkPathOnlyWhenWrongRelativePath(t *testing.T) {
+	service := NewService(&fakeAPIConnector{})
+	_, err := service.GenerateCyclePlan(context.Background(), headWatermarkRootArraySpec(map[string]any{
+		"strategy":   "head-watermark",
+		"items-path": "$",
+		"watermark": map[string]any{
+			"path": "author.date",
+			"type": "datetime",
+		},
+		"key-paths": []any{"node_id"},
+	}), "https://example.com", memoryCheckpointStore{})
+	if err == nil || !strings.Contains(err.Error(), "invalid x-incremental.watermark.path") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGenerateCyclePlanRejectsIncrementalWithoutPagination(t *testing.T) {
+	api := &fakeAPIConnector{
+		responses: map[string]func(req FetchRequest) ([]byte, error){
+			"/events": func(req FetchRequest) ([]byte, error) { return []byte(`[{"id":1}]`), nil },
+		},
+	}
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/events", &openapi3.PathItem{
+				Get: &openapi3.Operation{
+					Extensions: map[string]any{"x-res-type": "incremental"},
+					Responses: responseWithJSONSchema("#/components/schemas/events", openapi3.NewArraySchema().WithItems(
+						openapi3.NewObjectSchema().WithProperty("id", withPK(openapi3.NewIntegerSchema())),
+					)),
+				},
+			}),
+		),
+	}
+
+	service := NewService(api)
+	_, err := service.GenerateCyclePlan(context.Background(), spec, "https://example.com", memoryCheckpointStore{})
+	if err == nil || !strings.Contains(err.Error(), "requires cursor or offset pagination") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGenerateCyclePlanRejectsMixedTableModes(t *testing.T) {
+	schema := openapi3.NewArraySchema().WithItems(
+		openapi3.NewObjectSchema().WithProperty("id", withPK(openapi3.NewIntegerSchema())),
+	)
+	spec := &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/one-shot", &openapi3.PathItem{
+				Get: &openapi3.Operation{
+					Extensions: map[string]any{"x-res-type": "one-shot"},
+					Responses:  responseWithJSONSchema("#/components/schemas/shared", schema),
+				},
+			}),
+			openapi3.WithPath("/full", &openapi3.PathItem{
+				Get: &openapi3.Operation{
+					Extensions: map[string]any{"x-res-type": "full-reload"},
+					Responses:  responseWithJSONSchema("#/components/schemas/shared", schema),
+				},
+			}),
+		),
+	}
+
+	service := NewService(&fakeAPIConnector{})
+	_, err := service.GenerateCyclePlan(context.Background(), spec, "https://example.com", memoryCheckpointStore{})
+	if err == nil || !strings.Contains(err.Error(), "mixed x-res-type modes") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestGeneratePlanOffsetPaginationPerDependencyCombination(t *testing.T) {
 	api := &fakeAPIConnector{
 		responses: map[string]func(req FetchRequest) ([]byte, error){
@@ -796,6 +1292,144 @@ func TestGeneratePlanRelaxesRequiredColumnsWhenRowsContainNullsOrMissingValues(t
 	if !nullableByName["message"] {
 		t.Fatalf("expected message to relax to nullable because a row omitted it, got %+v", create.Columns)
 	}
+}
+
+func headWatermarkMarkedSpec(includeDownstream bool, nonIncremental bool, overrides ...map[string]any) *openapi3.T {
+	eventIDField := withPK(openapi3.NewIntegerSchema())
+	if includeDownstream {
+		eventIDField.Extensions["x-response-data"] = map[string]any{"id": "eventId"}
+	}
+
+	itemSchema := openapi3.NewObjectSchema().
+		WithProperty("id", eventIDField).
+		WithProperty("updated_at", openapi3.NewStringSchema()).
+		WithProperty("value", openapi3.NewStringSchema())
+	itemSchema.Extensions = map[string]any{"x-table-name": "events"}
+
+	rootSchema := openapi3.NewObjectSchema().
+		WithProperty("data", openapi3.NewObjectSchema().WithProperty("items", openapi3.NewArraySchema().WithItems(itemSchema))).
+		WithProperty("page", openapi3.NewObjectSchema().WithProperty("next_cursor", openapi3.NewStringSchema()))
+
+	cursorParam := openapi3.NewQueryParameter("cursor").WithSchema(openapi3.NewStringSchema())
+	cursorParam.Extensions = map[string]any{"x-param-data": map[string]any{"type": "cursor", "cursor": "page.next_cursor"}}
+
+	eventsExtensions := map[string]any{
+		"x-res-type": "incremental",
+		"x-incremental": map[string]any{
+			"strategy":   "head-watermark",
+			"items-path": "data.items",
+			"watermark": map[string]any{
+				"path": "updated_at",
+				"type": "datetime",
+			},
+			"key-paths": []any{"id"},
+		},
+	}
+	if nonIncremental {
+		eventsExtensions["x-res-type"] = "one-shot"
+	}
+	if len(overrides) > 0 {
+		eventsExtensions["x-incremental"] = overrides[0]
+	}
+
+	paths := []openapi3.NewPathsOption{
+		openapi3.WithPath("/events", &openapi3.PathItem{
+			Get: &openapi3.Operation{
+				Extensions: eventsExtensions,
+				Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: cursorParam}},
+				Responses:  responseWithJSONSchema("#/components/schemas/root", rootSchema),
+			},
+		}),
+	}
+	if includeDownstream {
+		eventIDParam := openapi3.NewQueryParameter("eventId").WithRequired(true).WithSchema(openapi3.NewIntegerSchema())
+		eventIDParam.Extensions = map[string]any{"x-param-data": map[string]any{"type": "operation", "operation-id": "eventId"}}
+		paths = append(paths, openapi3.WithPath("/details", &openapi3.PathItem{
+			Get: &openapi3.Operation{
+				Extensions: map[string]any{"x-res-type": "one-shot"},
+				Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: eventIDParam}},
+				Responses: responseWithJSONSchema("#/components/schemas/details", openapi3.NewArraySchema().WithItems(
+					openapi3.NewObjectSchema().WithProperty("id", withPK(openapi3.NewIntegerSchema())),
+				)),
+			},
+		}))
+	}
+
+	return &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths:   openapi3.NewPaths(paths...),
+	}
+}
+
+func headWatermarkRootArraySpec(overrides ...map[string]any) *openapi3.T {
+	authorSchema := openapi3.NewObjectSchema().WithProperty("date", openapi3.NewStringSchema())
+	commitInner := openapi3.NewObjectSchema().
+		WithProperty("url", withPK(openapi3.NewStringSchema())).
+		WithProperty("author", authorSchema)
+	itemSchema := openapi3.NewObjectSchema().
+		WithProperty("sha", withPK(openapi3.NewStringSchema())).
+		WithProperty("node_id", openapi3.NewStringSchema()).
+		WithProperty("commit", commitInner)
+	itemSchema.Extensions = map[string]any{"x-table-name": "commit_outer"}
+	itemSchema.Properties["commit"].Value.Extensions = map[string]any{"x-table-name": "commit_inner"}
+
+	rootSchema := openapi3.NewArraySchema().WithItems(itemSchema)
+
+	pageParam := openapi3.NewQueryParameter("page").WithSchema(openapi3.NewIntegerSchema())
+	pageParam.Extensions = map[string]any{"x-param-data": map[string]any{"type": "offset", "offset": map[string]any{"start": 1, "increment": 1}}}
+
+	extensions := map[string]any{
+		"x-res-type": "incremental",
+		"x-incremental": map[string]any{
+			"strategy":   "head-watermark",
+			"items-path": "$",
+			"watermark": map[string]any{
+				"path": "commit.author.date",
+				"type": "datetime",
+			},
+			"key-paths": []any{"node_id"},
+		},
+	}
+	if len(overrides) > 0 {
+		extensions["x-incremental"] = overrides[0]
+	}
+
+	return &openapi3.T{
+		OpenAPI: "3.0.3",
+		Info:    &openapi3.Info{Title: "test", Version: "1.0.0"},
+		Paths: openapi3.NewPaths(
+			openapi3.WithPath("/commits", &openapi3.PathItem{
+				Get: &openapi3.Operation{
+					Extensions: extensions,
+					Parameters: openapi3.Parameters{&openapi3.ParameterRef{Value: pageParam}},
+					Responses:  responseWithJSONSchema("#/components/schemas/commits", rootSchema),
+				},
+			}),
+		),
+	}
+}
+
+func insertedPrimaryKeysForTable(plan *MigrationPlan, tableName, pkColumn string) []string {
+	if plan == nil {
+		return nil
+	}
+	var values []string
+	for _, op := range plan.Operations {
+		insert, ok := op.(InsertRowsOp)
+		if !ok || insert.TableName != tableName {
+			continue
+		}
+		for _, row := range insert.Rows {
+			for i, column := range row.Columns {
+				if column == pkColumn && i < len(row.Values) {
+					values = append(values, fmt.Sprintf("%v", row.Values[i].Scalar))
+				}
+			}
+		}
+	}
+	sort.Strings(values)
+	return values
 }
 
 func buildThreeStepSpec() *openapi3.T {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"api-parser/internal/config"
 	"api-parser/internal/core"
@@ -16,6 +17,8 @@ import (
 type adapter struct {
 	connectionString string
 }
+
+const checkpointTableName = "parser_checkpoints"
 
 func init() {
 	db.Register("clickhouse", func(cfg config.DatabaseConfig) (core.MigrationTarget, error) {
@@ -66,6 +69,78 @@ func (a *adapter) Apply(ctx context.Context, plan *core.MigrationPlan) (core.App
 		return core.ApplyResult{}, err
 	}
 	return a.applySQL(ctx, sqlBytes, "migration")
+}
+
+func (a *adapter) LoadCheckpoint(ctx context.Context, key string) (*core.Checkpoint, error) {
+	conn, err := a.open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	if err := ensureCheckpointTable(ctx, conn); err != nil {
+		return nil, err
+	}
+
+	query := fmt.Sprintf(`SELECT checkpoint_key, operation_path, method, params_json, pagination_param, pagination_type, resume_value_json, updated_at
+FROM %s
+WHERE checkpoint_key = %s
+ORDER BY updated_at DESC
+LIMIT 1`, checkpointTableName, toSQLLiteral(core.Value{Scalar: key}))
+	row := conn.QueryRowContext(ctx, query)
+	var checkpoint core.Checkpoint
+	if err := row.Scan(
+		&checkpoint.Key,
+		&checkpoint.OperationPath,
+		&checkpoint.Method,
+		&checkpoint.ParamsJSON,
+		&checkpoint.PaginationParam,
+		&checkpoint.PaginationType,
+		&checkpoint.ResumeValueJSON,
+		&checkpoint.UpdatedAt,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load checkpoint: %w", err)
+	}
+	return &checkpoint, nil
+}
+
+func (a *adapter) SaveCheckpoints(ctx context.Context, checkpoints []core.Checkpoint) error {
+	if len(checkpoints) == 0 {
+		return nil
+	}
+	conn, err := a.open(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if err := ensureCheckpointTable(ctx, conn); err != nil {
+		return err
+	}
+	for _, checkpoint := range checkpoints {
+		updatedAt := checkpoint.UpdatedAt
+		if updatedAt.IsZero() {
+			updatedAt = time.Now().UTC()
+		}
+		stmt := fmt.Sprintf(`INSERT INTO %s (checkpoint_key, operation_path, method, params_json, pagination_param, pagination_type, resume_value_json, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s);`,
+			checkpointTableName,
+			toSQLLiteral(core.Value{Scalar: checkpoint.Key}),
+			toSQLLiteral(core.Value{Scalar: checkpoint.OperationPath}),
+			toSQLLiteral(core.Value{Scalar: checkpoint.Method}),
+			toSQLLiteral(core.Value{Scalar: checkpoint.ParamsJSON}),
+			toSQLLiteral(core.Value{Scalar: checkpoint.PaginationParam}),
+			toSQLLiteral(core.Value{Scalar: checkpoint.PaginationType}),
+			toSQLLiteral(core.Value{Scalar: checkpoint.ResumeValueJSON}),
+			toSQLLiteral(core.Value{Scalar: updatedAt.Format("2006-01-02 15:04:05.000")}),
+		)
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("save checkpoint: %w", err)
+		}
+	}
+	return nil
 }
 
 func (a *adapter) ExportFullSyncSQL(plan *core.FullSyncPlan) ([]byte, error) {
@@ -189,7 +264,9 @@ func linkTablePrimaryKey(op core.CreateLinkTableOp) []string {
 }
 
 func renderInsertRows(op core.InsertRowsOp, pkColumns []string, seenInsertKeys map[string]map[string]struct{}) []string {
-	lines := make([]string, 0, len(op.Rows))
+	lines := make([]string, 0, len(op.Rows)+1)
+	filteredRows := make([]core.InsertRow, 0, len(op.Rows))
+	deleteConditions := make([]string, 0)
 	for _, row := range op.Rows {
 		if insertKey, ok := buildInsertDedupKey(op.TableName, row, pkColumns); ok {
 			if _, exists := seenInsertKeys[op.TableName]; !exists {
@@ -199,7 +276,18 @@ func renderInsertRows(op core.InsertRowsOp, pkColumns []string, seenInsertKeys m
 				continue
 			}
 			seenInsertKeys[op.TableName][insertKey] = struct{}{}
+			deleteConditions = append(deleteConditions, buildDeleteCondition(row, pkColumns))
 		}
+		filteredRows = append(filteredRows, row)
+	}
+	if len(pkColumns) > 0 && len(deleteConditions) > 0 {
+		lines = append(lines, fmt.Sprintf(
+			"ALTER TABLE %s DELETE WHERE %s;",
+			op.TableName,
+			strings.Join(deleteConditions, " OR "),
+		))
+	}
+	for _, row := range filteredRows {
 		values := make([]string, 0, len(row.Values))
 		for _, value := range row.Values {
 			values = append(values, toSQLLiteral(value))
@@ -212,6 +300,23 @@ func renderInsertRows(op core.InsertRowsOp, pkColumns []string, seenInsertKeys m
 		))
 	}
 	return lines
+}
+
+func buildDeleteCondition(row core.InsertRow, pkColumns []string) string {
+	parts := make([]string, 0, len(pkColumns))
+	for _, pkColumn := range pkColumns {
+		for i, column := range row.Columns {
+			if column != pkColumn || i >= len(row.Values) {
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("%s = %s", pkColumn, toSQLLiteral(row.Values[i])))
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return "1 = 0"
+	}
+	return "(" + strings.Join(parts, " AND ") + ")"
 }
 
 func buildInsertDedupKey(tableName string, row core.InsertRow, pkColumns []string) (string, bool) {
@@ -246,6 +351,41 @@ func toClickHouseColumnType(col core.Column) string {
 		return "Nullable(" + base + ")"
 	}
 	return base
+}
+
+func (a *adapter) open(ctx context.Context) (*sql.DB, error) {
+	conn, err := sql.Open("clickhouse", a.connectionString)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	if err := conn.PingContext(ctx); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	return conn, nil
+}
+
+type checkpointExecer interface {
+	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
+}
+
+func ensureCheckpointTable(ctx context.Context, execer checkpointExecer) error {
+	_, err := execer.ExecContext(ctx, fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+  checkpoint_key String,
+  operation_path String,
+  method String,
+  params_json String,
+  pagination_param String,
+  pagination_type String,
+  resume_value_json String,
+  updated_at DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY checkpoint_key;`, checkpointTableName))
+	if err != nil {
+		return fmt.Errorf("ensure checkpoint table: %w", err)
+	}
+	return nil
 }
 
 func allowsNullable(typ string) bool {

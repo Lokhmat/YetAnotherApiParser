@@ -50,6 +50,14 @@ func (t *cmdFakeTarget) ExportFullSyncSQL(*core.FullSyncPlan) ([]byte, error) {
 	return t.exportFullSyncSQL, nil
 }
 
+func (t *cmdFakeTarget) LoadCheckpoint(context.Context, string) (*core.Checkpoint, error) {
+	return nil, nil
+}
+
+func (t *cmdFakeTarget) SaveCheckpoints(context.Context, []core.Checkpoint) error {
+	return nil
+}
+
 func (t *cmdFakeTarget) Capabilities() core.Capabilities {
 	return core.Capabilities{CanExportSQL: true, CanFullSync: true}
 }
@@ -74,6 +82,14 @@ func (cmdNoFullSyncTarget) ExportSQL(*core.MigrationPlan) ([]byte, error) {
 
 func (cmdNoFullSyncTarget) ExportFullSyncSQL(*core.FullSyncPlan) ([]byte, error) {
 	return nil, nil
+}
+
+func (cmdNoFullSyncTarget) LoadCheckpoint(context.Context, string) (*core.Checkpoint, error) {
+	return nil, nil
+}
+
+func (cmdNoFullSyncTarget) SaveCheckpoints(context.Context, []core.Checkpoint) error {
+	return nil
 }
 
 func (cmdNoFullSyncTarget) Capabilities() core.Capabilities {
@@ -106,7 +122,7 @@ func TestRunOneShotHappyPath(t *testing.T) {
 	if !strings.Contains(output, "Base URL: https://api.example.com") {
 		t.Fatalf("expected base URL in output, got %s", output)
 	}
-	if !strings.Contains(output, "Applied 3 migrations") {
+	if !strings.Contains(output, "Applied 3 statements") {
 		t.Fatalf("unexpected output: %s", output)
 	}
 	if !strings.Contains(output, "SELECT 1;") {
@@ -169,7 +185,7 @@ func TestRunPeriodicFullReloadLoopsUntilCanceled(t *testing.T) {
 	restore := stubMainDeps(t)
 	defer restore()
 
-	specPath := writeCmdSpec(t, true)
+	specPath := writeCmdSpecWithResType(t, true, "full-reload")
 	configPath := writeCmdConfig(t, specPath, 5, "postgres")
 	target := &cmdFakeTarget{
 		exportFullSyncSQL: []byte("DELETE FROM items;"),
@@ -192,7 +208,7 @@ func TestRunPeriodicFullReloadLoopsUntilCanceled(t *testing.T) {
 	if err := run(ctx, configPath, &out); err != nil {
 		t.Fatalf("run returned error: %v", err)
 	}
-	if !strings.Contains(out.String(), "Full reload cycle 1 applied 4 statements") {
+	if !strings.Contains(out.String(), "Cycle 1 applied 4 statements") {
 		t.Fatalf("unexpected output: %s", out.String())
 	}
 }
@@ -201,7 +217,7 @@ func TestRunRejectsPeriodicReloadWhenProviderLacksFullSync(t *testing.T) {
 	restore := stubMainDeps(t)
 	defer restore()
 
-	specPath := writeCmdSpec(t, true)
+	specPath := writeCmdSpecWithResType(t, true, "full-reload")
 	configPath := writeCmdConfig(t, specPath, 5, "sqlite")
 	newAPIConnector = func(string, config.APIConfig, observability.RequestLogger) (core.APIConnector, error) {
 		return cmdFakeConnector{payload: []byte(`[{"id":1}]`)}, nil
@@ -211,7 +227,7 @@ func TestRunRejectsPeriodicReloadWhenProviderLacksFullSync(t *testing.T) {
 	}
 
 	err := run(context.Background(), configPath, &bytes.Buffer{})
-	if err == nil || !strings.Contains(err.Error(), "does not support periodic full reload") {
+	if err == nil || !strings.Contains(err.Error(), "does not support full-reload operations") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -252,16 +268,20 @@ func stubMainDeps(t *testing.T) func() {
 }
 
 func writeCmdSpec(t *testing.T, withFetchablePath bool) string {
+	return writeCmdSpecWithResType(t, withFetchablePath, "one-shot")
+}
+
+func writeCmdSpecWithResType(t *testing.T, withFetchablePath bool, resType string) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "spec.json")
-	spec := `{
+	spec := fmt.Sprintf(`{
   "openapi": "3.0.3",
   "info": {"title": "test", "version": "1.0.0"},
   "paths": {
     "/items": {
       "get": {
-        "x-res-type": "one-shot",
+        "x-res-type": %q,
         "responses": {
           "200": {
             "description": "ok",
@@ -283,7 +303,7 @@ func writeCmdSpec(t *testing.T, withFetchablePath bool) string {
       }
     }
   }
-}`
+}`, resType)
 	if !withFetchablePath {
 		spec = `{"openapi":"3.0.3","info":{"title":"test","version":"1.0.0"},"paths":{}}`
 	}
@@ -313,7 +333,7 @@ database:
 runtime:
   sql_output_path: %q
   run_log_path: %q
-  full_reload_interval_seconds: %d
+  cycle_interval_seconds: %d
 `, specPath, dbProvider, sqlPath, filepath.Join(t.TempDir(), "run.log"), fullReloadInterval)
 	if err := os.WriteFile(path, []byte(strings.TrimSpace(body)), 0644); err != nil {
 		t.Fatalf("write config: %v", err)

@@ -14,12 +14,19 @@ import (
 )
 
 type staticStateSource struct {
-	status runner.Status
-	runs   []runner.RunSummary
+	status       runner.Status
+	runs         []runner.RunSummary
+	triggerCycle func() error
 }
 
 func (s staticStateSource) StatusSnapshot() runner.Status     { return s.status }
 func (s staticStateSource) RunsSnapshot() []runner.RunSummary { return s.runs }
+func (s staticStateSource) TriggerCycle() error {
+	if s.triggerCycle != nil {
+		return s.triggerCycle()
+	}
+	return nil
+}
 
 func TestServerStatusRunsAndLogsEndpoints(t *testing.T) {
 	dir := t.TempDir()
@@ -108,6 +115,25 @@ func TestServerStatusRunsAndLogsEndpoints(t *testing.T) {
 		srv.httpServer.Handler.ServeHTTP(resp, req)
 		if resp.Code != http.StatusOK {
 			t.Fatalf("unexpected health status: %d", resp.Code)
+		}
+	})
+
+	t.Run("trigger cycle", func(t *testing.T) {
+		triggered := false
+		srv := NewServer(config.Config{}, staticStateSource{
+			triggerCycle: func() error {
+				triggered = true
+				return nil
+			},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v1/cycle/trigger", nil)
+		resp := httptest.NewRecorder()
+		srv.httpServer.Handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusAccepted {
+			t.Fatalf("unexpected trigger status: %d body=%s", resp.Code, resp.Body.String())
+		}
+		if !triggered {
+			t.Fatal("expected trigger callback to be called")
 		}
 	})
 }

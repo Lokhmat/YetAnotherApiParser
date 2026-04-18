@@ -104,6 +104,11 @@ func TestRunStatusRunsAndLogsCommands(t *testing.T) {
 				}}
 			case "/v1/logs":
 				payload = map[string]any{"lines": []string{"a", "b"}}
+			case "/v1/cycle/trigger":
+				if req.Method != http.MethodPost {
+					t.Fatalf("expected POST for trigger, got %s", req.Method)
+				}
+				payload = map[string]any{"status": "scheduled"}
 			default:
 				return &http.Response{
 					StatusCode: http.StatusNotFound,
@@ -150,6 +155,16 @@ func TestRunStatusRunsAndLogsCommands(t *testing.T) {
 		}
 		if strings.TrimSpace(out.String()) != "a\nb" {
 			t.Fatalf("unexpected logs output: %q", out.String())
+		}
+	})
+
+	t.Run("cycle start", func(t *testing.T) {
+		var out bytes.Buffer
+		if err := run(context.Background(), []string{"cycle", "start", "--addr", "http://parser.local"}, &out, &bytes.Buffer{}); err != nil {
+			t.Fatalf("run cycle start returned error: %v", err)
+		}
+		if strings.TrimSpace(out.String()) != "cycle trigger accepted" {
+			t.Fatalf("unexpected cycle output: %q", out.String())
 		}
 	})
 }

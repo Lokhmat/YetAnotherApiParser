@@ -2,10 +2,12 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,9 +65,15 @@ type RunSummary struct {
 	Outcome RunOutcome `json:"outcome"`
 }
 
+var (
+	ErrManualCycleUnsupported  = errors.New("manual cycle trigger is available only in periodic mode")
+	ErrCycleTriggerUnavailable = errors.New("cycle can be triggered only while runner is sleeping")
+	ErrCycleTriggerPending     = errors.New("manual cycle trigger is already pending")
+)
+
 type Planner interface {
-	GeneratePlan(ctx context.Context, spec *openapi3.T, baseURL string) (*core.MigrationPlan, error)
-	GenerateFullSyncPlan(ctx context.Context, spec *openapi3.T, baseURL string) (*core.FullSyncPlan, error)
+	GenerateCyclePlan(ctx context.Context, spec *openapi3.T, baseURL string, checkpoints core.MigrationTarget) (*core.CyclePlan, error)
+	CommitCycle(plan *core.CyclePlan)
 }
 
 type Runner struct {
@@ -78,6 +86,7 @@ type Runner struct {
 	tracker     *RequestTracker
 	writeFile   func(string, []byte, fs.FileMode) error
 	sleep       func(context.Context, time.Duration) error
+	triggerNext chan struct{}
 
 	state *syncState
 }
@@ -95,7 +104,7 @@ func newSyncState(limit int) syncState {
 
 func New(cfg config.Config, spec *openapi3.T, planner Planner, target core.MigrationTarget, out io.Writer, tracker *RequestTracker, eventLogger observability.EventLogger, writeFile func(string, []byte, fs.FileMode) error, sleep func(context.Context, time.Duration) error) *Runner {
 	mode := JobModeOneShot
-	if cfg.Runtime.FullReloadEnabled {
+	if cfg.Runtime.CycleEnabled {
 		mode = JobModePeriodic
 	}
 	r := &Runner{
@@ -108,6 +117,7 @@ func New(cfg config.Config, spec *openapi3.T, planner Planner, target core.Migra
 		tracker:     tracker,
 		writeFile:   writeFile,
 		sleep:       sleep,
+		triggerNext: make(chan struct{}, 1),
 		state:       &syncState{limit: cfg.Control.HistoryLimit},
 	}
 	r.withState(func(state *syncState) {
@@ -122,7 +132,7 @@ func New(cfg config.Config, spec *openapi3.T, planner Planner, target core.Migra
 func (r *Runner) Run(ctx context.Context) error {
 	r.logEvent("info", "runner_started", "runner started", nil)
 
-	if !r.cfg.Runtime.FullReloadEnabled {
+	if !r.cfg.Runtime.CycleEnabled {
 		err := r.runOneShot(ctx)
 		if err != nil {
 			r.markFailure(err)
@@ -130,13 +140,7 @@ func (r *Runner) Run(ctx context.Context) error {
 		return err
 	}
 
-	if !r.target.Capabilities().CanFullSync {
-		err := fmt.Errorf("db provider %q does not support periodic full reload", r.cfg.Database.Provider)
-		r.markFailure(err)
-		return err
-	}
-
-	fmt.Fprintf(r.out, "Periodic full reload enabled: every %ds\n", r.cfg.Runtime.FullReloadIntervalSeconds)
+	fmt.Fprintf(r.out, "Periodic cycles enabled: every %ds\n", r.cfg.Runtime.CycleIntervalSeconds)
 
 	for cycle := 1; ; cycle++ {
 		err := r.runPeriodicCycle(ctx, cycle)
@@ -149,13 +153,13 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 
-		nextRunAt := time.Now().Add(r.cfg.Runtime.FullReloadInterval)
+		nextRunAt := time.Now().Add(r.cfg.Runtime.CycleInterval)
 		r.withState(func(state *syncState) {
 			state.status.Phase = PhaseSleeping
 			state.status.NextRunAt = &nextRunAt
 			state.status.FinishedAt = nil
 		})
-		if err := r.sleep(ctx, r.cfg.Runtime.FullReloadInterval); err != nil {
+		if err := r.waitForNextCycle(ctx, r.cfg.Runtime.CycleInterval); err != nil {
 			if err == context.Canceled {
 				r.setStopping()
 				return nil
@@ -163,6 +167,28 @@ func (r *Runner) Run(ctx context.Context) error {
 			r.markFailure(err)
 			return err
 		}
+	}
+}
+
+func (r *Runner) TriggerCycle() error {
+	if !r.cfg.Runtime.CycleEnabled {
+		return ErrManualCycleUnsupported
+	}
+
+	status := r.StatusSnapshot()
+	if status.Phase != PhaseSleeping {
+		return ErrCycleTriggerUnavailable
+	}
+
+	select {
+	case r.triggerNext <- struct{}{}:
+		r.withState(func(state *syncState) {
+			state.status.NextRunAt = nil
+		})
+		r.logEvent("info", "cycle_triggered", "manual cycle trigger accepted", map[string]any{"cycle": status.Cycle})
+		return nil
+	default:
+		return ErrCycleTriggerPending
 	}
 }
 
@@ -187,23 +213,30 @@ func (r *Runner) RunsSnapshot() []RunSummary {
 }
 
 func (r *Runner) runOneShot(ctx context.Context) error {
-	plan, metrics, err := r.buildOneShotPlan(ctx, 1)
+	plan, metrics, err := r.buildCyclePlan(ctx, 1)
 	if err != nil {
 		return err
 	}
 
-	sqlBytes, err := r.target.ExportSQL(plan)
+	sqlBytes, err := r.exportCycleSQL(plan)
 	if err != nil {
 		return r.failRun(1, err)
 	}
 
-	fmt.Fprintf(r.out, "\nGenerated %d operations:\n", len(plan.Operations))
+	totalOps := 0
+	if plan.UpsertPlan != nil {
+		totalOps += len(plan.UpsertPlan.Operations)
+	}
+	if plan.FullSyncPlan != nil {
+		totalOps += len(plan.FullSyncPlan.Tables)
+	}
+	fmt.Fprintf(r.out, "\nGenerated %d operations:\n", totalOps)
 	if len(sqlBytes) > 0 {
 		fmt.Fprintf(r.out, "\n%s\n", string(sqlBytes))
 	}
 
 	r.updateApplyMetrics(1, metrics)
-	result, err := r.target.Apply(ctx, plan)
+	result, err := r.applyCyclePlan(ctx, plan)
 	if err != nil {
 		log.Printf("database apply failed: %v", err)
 		r.logEvent("error", "apply_failed", "database apply failed", map[string]any{"cycle": 1, "error": err.Error()})
@@ -218,29 +251,30 @@ func (r *Runner) runOneShot(ctx context.Context) error {
 		return nil
 	}
 
-	fmt.Fprintf(r.out, "Applied %d migrations\n", result.AppliedCount)
+	r.planner.CommitCycle(plan)
+	fmt.Fprintf(r.out, "Applied %d statements\n", result.AppliedCount)
 	r.finishRun(1, RunOutcomeSucceeded, metrics, result.AppliedCount, nil, true)
 	return nil
 }
 
 func (r *Runner) runPeriodicCycle(ctx context.Context, cycle int) error {
-	plan, metrics, err := r.buildFullSyncPlan(ctx, cycle)
+	plan, metrics, err := r.buildCyclePlan(ctx, cycle)
 	if err != nil {
 		return err
 	}
 
-	sqlBytes, err := r.target.ExportFullSyncSQL(plan)
+	sqlBytes, err := r.exportCycleSQL(plan)
 	if err != nil {
 		return r.failRun(cycle, err)
 	}
 
 	r.updateApplyMetrics(cycle, metrics)
-	result, err := r.target.ApplyFullSync(ctx, plan)
+	result, err := r.applyCyclePlan(ctx, plan)
 	if err != nil {
-		log.Printf("periodic full reload cycle %d failed: %v", cycle, err)
-		r.logEvent("error", "full_reload_failed", "periodic full reload cycle failed", map[string]any{"cycle": cycle, "error": err.Error()})
+		log.Printf("periodic cycle %d failed: %v", cycle, err)
+		r.logEvent("error", "cycle_apply_failed", "periodic cycle failed", map[string]any{"cycle": cycle, "error": err.Error()})
 		if len(sqlBytes) > 0 {
-			log.Printf("saving full sync SQL to %s...", r.cfg.Runtime.SQLOutputPath)
+			log.Printf("saving cycle SQL to %s...", r.cfg.Runtime.SQLOutputPath)
 			if writeErr := r.writeFile(r.cfg.Runtime.SQLOutputPath, sqlBytes, 0644); writeErr != nil {
 				return r.failRun(cycle, fmt.Errorf("failed to write migrations to file: %w", writeErr))
 			}
@@ -250,7 +284,8 @@ func (r *Runner) runPeriodicCycle(ctx context.Context, cycle int) error {
 		return nil
 	}
 
-	fmt.Fprintf(r.out, "Full reload cycle %d applied %d statements\n", cycle, result.AppliedCount)
+	r.planner.CommitCycle(plan)
+	fmt.Fprintf(r.out, "Cycle %d applied %d statements\n", cycle, result.AppliedCount)
 	r.finishRun(cycle, RunOutcomeSucceeded, metrics, result.AppliedCount, nil, true)
 	return nil
 }
@@ -260,27 +295,16 @@ type runMetrics struct {
 	plannedRowCount   int
 }
 
-func (r *Runner) buildOneShotPlan(ctx context.Context, cycle int) (*core.MigrationPlan, runMetrics, error) {
+func (r *Runner) buildCyclePlan(ctx context.Context, cycle int) (*core.CyclePlan, runMetrics, error) {
 	r.startRun(cycle)
-	plan, err := r.planner.GeneratePlan(ctx, r.spec, r.cfg.API.BaseURL)
+	plan, err := r.planner.GenerateCyclePlan(ctx, r.spec, r.cfg.API.BaseURL, r.target)
 	if err != nil {
-		return nil, runMetrics{}, r.failRun(cycle, fmt.Errorf("generate migration plan: %w", err))
+		return nil, runMetrics{}, r.failRun(cycle, fmt.Errorf("generate cycle plan: %w", err))
 	}
-	metrics := summarizeMigrationPlan(plan)
-	r.withState(func(state *syncState) {
-		state.status.ManagedTableCount = metrics.managedTableCount
-		state.status.PlannedRowCount = metrics.plannedRowCount
-	})
-	return plan, metrics, nil
-}
-
-func (r *Runner) buildFullSyncPlan(ctx context.Context, cycle int) (*core.FullSyncPlan, runMetrics, error) {
-	r.startRun(cycle)
-	plan, err := r.planner.GenerateFullSyncPlan(ctx, r.spec, r.cfg.API.BaseURL)
-	if err != nil {
-		return nil, runMetrics{}, r.failRun(cycle, fmt.Errorf("generate full sync plan: %w", err))
+	if plan != nil && plan.FullSyncPlan != nil && len(plan.FullSyncPlan.Tables) > 0 && !r.target.Capabilities().CanFullSync {
+		return nil, runMetrics{}, r.failRun(cycle, fmt.Errorf("db provider %q does not support full-reload operations", r.cfg.Database.Provider))
 	}
-	metrics := summarizeFullSyncPlan(plan)
+	metrics := summarizeCyclePlan(plan)
 	r.withState(func(state *syncState) {
 		state.status.ManagedTableCount = metrics.managedTableCount
 		state.status.PlannedRowCount = metrics.plannedRowCount
@@ -290,6 +314,7 @@ func (r *Runner) buildFullSyncPlan(ctx context.Context, cycle int) (*core.FullSy
 
 func (r *Runner) startRun(cycle int) {
 	now := time.Now()
+	r.drainTriggerSignal()
 	r.tracker.Start()
 	r.withState(func(state *syncState) {
 		state.status.Cycle = cycle
@@ -338,7 +363,7 @@ func (r *Runner) finishRun(cycle int, outcome RunOutcome, metrics runMetrics, ap
 			state.status.LastError = ""
 			state.status.LastSuccessAt = &finishedAt
 		}
-		if !r.cfg.Runtime.FullReloadEnabled {
+		if !r.cfg.Runtime.CycleEnabled {
 			if outcome == RunOutcomeSucceeded {
 				state.status.Phase = PhaseCompleted
 			} else {
@@ -419,6 +444,38 @@ func (r *Runner) setStopping() {
 	r.logEvent("info", "runner_stopping", "runner stopping", nil)
 }
 
+func (r *Runner) waitForNextCycle(ctx context.Context, delay time.Duration) error {
+	sleepCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	sleepDone := make(chan error, 1)
+	go func() {
+		sleepDone <- r.sleep(sleepCtx, delay)
+	}()
+
+	select {
+	case err := <-sleepDone:
+		return err
+	case <-r.triggerNext:
+		cancel()
+		select {
+		case <-sleepDone:
+		default:
+		}
+		return nil
+	}
+}
+
+func (r *Runner) drainTriggerSignal() {
+	for {
+		select {
+		case <-r.triggerNext:
+		default:
+			return
+		}
+	}
+}
+
 func (r *Runner) logEvent(level, kind, message string, fields map[string]any) {
 	if r.eventLogger == nil {
 		return
@@ -436,6 +493,62 @@ func (r *Runner) withState(fn func(state *syncState)) {
 	r.state.mu.Lock()
 	defer r.state.mu.Unlock()
 	fn(r.state)
+}
+
+func (r *Runner) exportCycleSQL(plan *core.CyclePlan) ([]byte, error) {
+	if plan == nil {
+		return nil, nil
+	}
+	chunks := make([]string, 0, 2)
+	if plan.UpsertPlan != nil {
+		sqlBytes, err := r.target.ExportSQL(plan.UpsertPlan)
+		if err != nil {
+			return nil, err
+		}
+		if len(sqlBytes) > 0 {
+			chunks = append(chunks, string(sqlBytes))
+		}
+	}
+	if plan.FullSyncPlan != nil {
+		sqlBytes, err := r.target.ExportFullSyncSQL(plan.FullSyncPlan)
+		if err != nil {
+			return nil, err
+		}
+		if len(sqlBytes) > 0 {
+			chunks = append(chunks, string(sqlBytes))
+		}
+	}
+	if len(chunks) == 0 {
+		return nil, nil
+	}
+	return []byte(strings.Join(chunks, "\n\n")), nil
+}
+
+func (r *Runner) applyCyclePlan(ctx context.Context, plan *core.CyclePlan) (core.ApplyResult, error) {
+	result := core.ApplyResult{}
+	if plan == nil {
+		return result, nil
+	}
+	if plan.UpsertPlan != nil {
+		applyResult, err := r.target.Apply(ctx, plan.UpsertPlan)
+		result.AppliedCount += applyResult.AppliedCount
+		if err != nil {
+			return result, err
+		}
+	}
+	if plan.FullSyncPlan != nil && len(plan.FullSyncPlan.Tables) > 0 {
+		applyResult, err := r.target.ApplyFullSync(ctx, plan.FullSyncPlan)
+		result.AppliedCount += applyResult.AppliedCount
+		if err != nil {
+			return result, err
+		}
+	}
+	if len(plan.PendingCheckpoints) > 0 {
+		if err := r.target.SaveCheckpoints(ctx, plan.PendingCheckpoints); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
 }
 
 func summarizeMigrationPlan(plan *core.MigrationPlan) runMetrics {
@@ -459,6 +572,18 @@ func summarizeMigrationPlan(plan *core.MigrationPlan) runMetrics {
 			metrics.plannedRowCount += len(typed.Rows)
 		}
 	}
+	return metrics
+}
+
+func summarizeCyclePlan(plan *core.CyclePlan) runMetrics {
+	metrics := runMetrics{}
+	if plan == nil {
+		return metrics
+	}
+	upsertMetrics := summarizeMigrationPlan(plan.UpsertPlan)
+	fullSyncMetrics := summarizeFullSyncPlan(plan.FullSyncPlan)
+	metrics.managedTableCount = upsertMetrics.managedTableCount + fullSyncMetrics.managedTableCount
+	metrics.plannedRowCount = upsertMetrics.plannedRowCount + fullSyncMetrics.plannedRowCount
 	return metrics
 }
 

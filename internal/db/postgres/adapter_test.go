@@ -67,8 +67,8 @@ func TestExportSQL(t *testing.T) {
 		`"phones" INTEGER[]`,
 		`CREATE TABLE IF NOT EXISTS "orders_tags_link"`,
 		`PRIMARY KEY ("orders_oid", "tags_tid")`,
-		`INSERT INTO "users" ("id", "name", "phones") VALUES (1, E'alice', ARRAY[10, 11]::INTEGER[]) ON CONFLICT ("id") DO NOTHING;`,
-		`INSERT INTO "users" ("id", "name") VALUES (2, E'line1\nline2') ON CONFLICT ("id") DO NOTHING;`,
+		`INSERT INTO "users" ("id", "name", "phones") VALUES (1, E'alice', ARRAY[10, 11]::INTEGER[]) ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name", "phones" = EXCLUDED."phones";`,
+		`INSERT INTO "users" ("id", "name") VALUES (2, E'line1\nline2') ON CONFLICT ("id") DO UPDATE SET "name" = EXCLUDED."name";`,
 	} {
 		if !strings.Contains(sqlText, needle) {
 			t.Fatalf("expected SQL to contain %q\nactual:\n%s", needle, sqlText)
